@@ -8,3 +8,6 @@ readme = "README.md"
 license = "GPL-3.0"
 
 [dependencies]
+futures = "0.1.17"
+packet-stream = "0.1.0"
+tokio-io = "0.1.4"
