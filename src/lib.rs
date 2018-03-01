@@ -7,28 +7,57 @@ extern crate packet_stream;
 extern crate tokio_io;
 extern crate serde;
 extern crate serde_json;
-#[macro_use]
+#[macro_use(Serialize, Deserialize)]
 extern crate serde_derive;
 
-use std::str::FromStr;
-use std::io;
+#[cfg(test)]
+extern crate partial_io;
+#[cfg(test)]
+extern crate quickcheck;
+#[cfg(test)]
+extern crate async_ringbuffer;
+#[cfg(test)]
+extern crate rand;
+
+use std::convert::From;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::convert::From;
+use std::io;
+use std::marker::PhantomData;
 
 use futures::prelude::*;
+use futures::unsync::oneshot::Canceled;
 use tokio_io::{AsyncRead, AsyncWrite};
-use packet_stream::{packet_stream, PsIn, PsOut, PsSink, PsStream, InRequest, InResponse,
-                    IncomingPacket};
+use packet_stream::{packet_stream, PsIn, PsOut, ConnectionError, PsSink, PsStream, InRequest,
+                    InResponse, IncomingPacket, PacketType, OutRequest, OutResponse, Metadata};
 use serde_json::Value;
+use serde_json::{to_vec, from_slice};
+use serde_json::error::Error as SerdeError;
+use serde::{Serialize, Deserialize};
+use serde::de::DeserializeOwned;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
-struct Rpc {
-    name: Vec<String>,
+struct RpcVal<'a, 'b, A: 'b> {
+    name: Box<[&'a str]>,
     #[serde(rename = "type")]
     type_: RpcType,
-    args: Vec<Value>,
+    args: &'b A,
+}
+
+impl<'a, 'b, A: Serialize + 'b> RpcVal<'a, 'b, A> {
+    fn new(name: Box<[&'a str]>, type_: RpcType, args: &'b A) -> RpcVal<'a, 'b, A> {
+        RpcVal { name, type_, args }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+struct InRpc {
+    name: Box<[String]>,
+    #[serde(rename = "type")]
+    type_: RpcType,
+    args: Box<[Value]>,
 }
 
 const SOURCE: &'static str = "source";
@@ -63,26 +92,6 @@ impl RpcType {
             RpcType::Duplex => DUPLEX,
             RpcType::Async => ASYNC,
             RpcType::Sync => SYNC,
-        }
-    }
-}
-
-impl FromStr for RpcType {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == SOURCE {
-            Ok(RpcType::Source)
-        } else if s == SINK {
-            Ok(RpcType::Sink)
-        } else if s == DUPLEX {
-            Ok(RpcType::Duplex)
-        } else if s == ASYNC {
-            Ok(RpcType::Async)
-        } else if s == SYNC {
-            Ok(RpcType::Sync)
-        } else {
-            Err(())
         }
     }
 }
@@ -132,181 +141,507 @@ impl From<io::Error> for RpcError {
     }
 }
 
+impl From<SerdeError> for RpcError {
+    fn from(err: SerdeError) -> RpcError {
+        RpcError::InvalidData
+    }
+}
+
+/// An error that can be emitted during the rpc process when receiving multiplexed data.
+#[derive(Debug)]
+pub enum ConnectionRpcError {
+    /// A `ConnectionError` occured.
+    ConnectionError(ConnectionError),
+    /// Received a packet containing invalid data.
+    ///
+    /// For example, the packet could have the wrong type, it could contain
+    /// malformed json, it could set inappropriate flags, it could lack required
+    /// json fields, etc.
+    InvalidData,
+}
+
+impl Display for ConnectionRpcError {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            ConnectionRpcError::ConnectionError(ref err) => {
+                write!(f, "Connection rpc error: {}", err)
+            }
+            ConnectionRpcError::InvalidData => write!(f, "Connection rpc error: Invalid data"),
+        }
+    }
+}
+
+impl Error for ConnectionRpcError {
+    fn description(&self) -> &str {
+        match *self {
+            ConnectionRpcError::ConnectionError(ref err) => err.description(),
+            ConnectionRpcError::InvalidData => "Received a packet that contained invalid data",
+        }
+    }
+}
+
+impl From<ConnectionError> for ConnectionRpcError {
+    fn from(err: ConnectionError) -> ConnectionRpcError {
+        ConnectionRpcError::ConnectionError(err)
+    }
+}
+
+impl From<SerdeError> for ConnectionRpcError {
+    fn from(err: SerdeError) -> ConnectionRpcError {
+        ConnectionRpcError::InvalidData
+    }
+}
+
+/// Implementors of this trait are rpcs that can be sent to the peer. The serilize implementation
+/// should provide the argument value(s).
+pub trait Rpc: Serialize {
+    /// The names for this rpc.
+    fn names() -> Box<[&'static str]>;
+}
+
+/// A future that emits the wrapped writer of a muxrpc connection once the outgoing half of the
+/// has been fully closed.
+pub struct Closed<W>(packet_stream::Closed<W, Box<[u8]>>);
+
+impl<W> Future for Closed<W> {
+    type Item = W;
+    /// This can only be emitted if a previously polled/written `OutRequest`,
+    /// `OutResponse`s or `PsSink` is dropped whithout waiting for it to finish. TODO put muxrpc stuff here
+    type Error = Canceled;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.0.poll()
+    }
+}
+
 /// Take ownership of an AsyncRead and an AsyncWrite to create the two halves of
 /// a muxrpc connection.
 ///
 /// `R` is the `AsyncRead` for reading bytes from the peer, `W` is the
 /// `AsyncWrite` for writing bytes to the peer, and `B` is the type that is used
 /// as input for sending data.
-///
-/// Note that the AsyncRead may be polled for data even after it has signalled
-/// end of data. Only use AsyncReads that can correctly handle this.
-pub fn muxrpc<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>>(r: R,
-                                                           w: W)
-                                                           -> (RpcIn<R, W, B>, RpcOut<R, W, B>) {
-    let (ps_in, ps_out) = packet_stream(r, w);
-    (RpcIn::new(ps_in), RpcOut::new(ps_out))
+pub fn muxrpc<R: AsyncRead, W: AsyncWrite>(r: R, w: W) -> (RpcIn<R, W>, RpcOut<R, W>, Closed<W>) {
+    let (ps_in, ps_out, closed) = packet_stream(r, w);
+    (RpcIn::new(ps_in), RpcOut::new(ps_out), Closed(closed))
 }
 
 /// A stream of incoming rpcs from the peer.
-pub struct RpcIn<R: AsyncRead, W, B> {
-    ps_in: PsIn<R, W, B>,
-}
+pub struct RpcIn<R: AsyncRead, W>(PsIn<R, W, Box<[u8]>>);
 
-impl<R: AsyncRead, W, B> RpcIn<R, W, B> {
-    fn new(ps_in: PsIn<R, W, B>) -> RpcIn<R, W, B> {
-        RpcIn { ps_in }
+impl<R: AsyncRead, W> RpcIn<R, W> {
+    fn new(ps_in: PsIn<R, W, Box<[u8]>>) -> RpcIn<R, W> {
+        RpcIn(ps_in)
     }
 }
 
-impl<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> Stream for RpcIn<R, W, B> {
-    /// Name(s), args, communication-handle
-    type Item = (Vec<String>, Vec<Value>, IncomingRpc<R, W, B>);
+impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
+    /// Name(s) and args of the rpc, and a handle for reacting to the rpc
+    type Item = (Box<[String]>, Box<[Value]>, IncomingRpc<R, W>);
     type Error = RpcError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let packet = try_ready!(self.ps_in.poll());
-
-        match packet {
+        match try_ready!(self.0.poll()) {
             None => Ok(Async::Ready(None)),
 
-            Some(IncomingPacket::Request(req)) => {
-                if !req.packet().is_json_packet() {
-                    return Err(RpcError::InvalidData);
-                }
+            Some((data, metadata, handle)) => {
+                if metadata.packet_type == PacketType::Json {
+                    let rpc = from_slice::<InRpc>(&data)?;
 
-                match serde_json::from_slice::<Rpc>(req.packet().data()) {
-                    Ok(rpc) => {
-                        match rpc.type_ {
-                            RpcType::Sync => {
-                                Ok(Async::Ready(Some((rpc.name,
-                                                      rpc.args,
-                                                      IncomingRpc::Sync(InSync::new(req))))))
+                    match handle {
+                        IncomingPacket::Request(req) => {
+                            match rpc.type_ {
+                                RpcType::Sync => unimplemented!(),
+                                RpcType::Async => {
+                                    Ok(Async::Ready(Some((rpc.name,
+                                                          rpc.args,
+                                                          IncomingRpc::Async(InAsync::new(req))))))
+                                }
+                                _ => Err(RpcError::InvalidData),
                             }
-                            RpcType::Async => {
-                                Ok(Async::Ready(Some((rpc.name,
-                                                      rpc.args,
-                                                      IncomingRpc::Async(InAsync::new(req))))))
-                            }
-                            _ => Err(RpcError::InvalidData),
                         }
-                    }
-                    Err(err) => Err(RpcError::InvalidData),
-                }
-            }
 
-            Some(IncomingPacket::Duplex(p, ps_sink, ps_stream)) => {
-                if !p.is_json_packet() {
-                    return Err(RpcError::InvalidData);
-                }
-
-                match serde_json::from_slice::<Rpc>(p.data()) {
-                    Ok(rpc) => {
-                        match rpc.type_ {
-                            RpcType::Source => {
-                                Ok(Async::Ready(Some((rpc.name,
-                                                      rpc.args,
-                                                      IncomingRpc::Source(RpcSink::new(ps_sink))))))
-                            }
-                            RpcType::Sink => {
-                                Ok(Async::Ready(Some((rpc.name,
-                                                      rpc.args,
-                                                      IncomingRpc::Sink(RpcStream::new(ps_stream))))))
-                            }
-                            RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args,
-                                IncomingRpc::Duplex(RpcSink::new(ps_sink),
-                                RpcStream::new(ps_stream)))))),
-                            _ => Err(RpcError::InvalidData),
-                        }
+                        IncomingPacket::Duplex(ps_sink, ps_stream) => unimplemented!(),
                     }
-                    Err(err) => Err(RpcError::InvalidData),
+                } else {
+                    Err(RpcError::InvalidData)
                 }
             }
         }
+
+        // let packet = try_ready!(self.ps_in.poll());
+        //
+        // match packet {
+        //     None => Ok(Async::Ready(None)),
+        //
+        //     Some(IncomingPacket::Request(req)) => {
+        //         if !req.packet().is_json_packet() {
+        //             return Err(RpcError::InvalidData);
+        //         }
+        //
+        //         match serde_json::from_slice::<Rpc>(req.packet().data()) {
+        //             Ok(rpc) => {
+        //                 match rpc.type_ {
+        //                     RpcType::Sync => {
+        //                         Ok(Async::Ready(Some((rpc.name,
+        //                                               rpc.args,
+        //                                               IncomingRpc::Sync(InSync::new(req))))))
+        //                     }
+        //                     RpcType::Async => {
+        //                         Ok(Async::Ready(Some((rpc.name,
+        //                                               rpc.args,
+        //                                               IncomingRpc::Async(InAsync::new(req))))))
+        //                     }
+        //                     _ => Err(RpcError::InvalidData),
+        //                 }
+        //             }
+        //             Err(err) => Err(RpcError::InvalidData),
+        //         }
+        //     }
+        //
+        //     Some(IncomingPacket::Duplex(p, ps_sink, ps_stream)) => {
+        //         if !p.is_json_packet() {
+        //             return Err(RpcError::InvalidData);
+        //         }
+        //
+        //         match serde_json::from_slice::<Rpc>(p.data()) {
+        //             Ok(rpc) => {
+        //                 match rpc.type_ {
+        //                     RpcType::Source => {
+        //                         Ok(Async::Ready(Some((rpc.name,
+        //                                               rpc.args,
+        //                                               IncomingRpc::Source(RpcSink::new(ps_sink))))))
+        //                     }
+        //                     RpcType::Sink => {
+        //                         Ok(Async::Ready(Some((rpc.name,
+        //                                               rpc.args,
+        //                                               IncomingRpc::Sink(RpcStream::new(ps_stream))))))
+        //                     }
+        //                     RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args,
+        //                         IncomingRpc::Duplex(RpcSink::new(ps_sink),
+        //                         RpcStream::new(ps_stream)))))),
+        //                     _ => Err(RpcError::InvalidData),
+        //                 }
+        //             }
+        //             Err(err) => Err(RpcError::InvalidData),
+        //         }
+        //     }
+        // }
     }
 }
 
-/// An incoming packet, initiated by the peer.
-pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite, B: AsRef<[u8]>> {
-    /// A source request. You get a sink, the peer gets a stream.
-    Source(RpcSink<W, B>),
-    /// A sink request. You get a stream, the peer gets a sink.
-    Sink(RpcStream<R>),
-    /// A duplex request. Both peers get a stream and a sink.
-    Duplex(RpcSink<W, B>, RpcStream<R>),
-    /// An async request. You get an InAsync, the peer gets an OutAsync.
-    Async(InAsync<W, B>),
-    /// A sync request. You get an InSync, the peer gets an OutSync.
-    Sync(InSync<W, B>),
+fn unwrap_serialize<S: Serialize>(s: S) -> Box<[u8]> {
+    match to_vec(&s) {
+        Ok(data) => data.into_boxed_slice(),
+        Err(_) => panic!("Muxrpc serialization to bytes failed"),
+    }
 }
 
 /// Allows sending rpcs to the peer.
-pub struct RpcOut<R: AsyncRead, W, B>(PsOut<R, W, B>);
+pub struct RpcOut<R: AsyncRead, W>(PsOut<R, W, Box<[u8]>>);
 
-impl<R: AsyncRead, W, B> RpcOut<R, W, B> {
-    fn new(ps_out: PsOut<R, W, B>) -> RpcOut<R, W, B> {
+impl<R: AsyncRead, W> RpcOut<R, W> {
+    fn new(ps_out: PsOut<R, W, Box<[u8]>>) -> RpcOut<R, W> {
         RpcOut(ps_out)
     }
 }
 
-/// A sink for writing data to the peer.
-pub struct RpcSink<W: AsyncWrite, B: AsRef<[u8]>> {
-    sink: PsSink<W, B>,
-}
+impl<R, W> RpcOut<R, W>
+    where R: AsyncRead,
+          W: AsyncWrite
+{
+    /// Send an async to the peer.
+    ///
+    /// The `OutAsync` Future must be polled to actually start sending the request.
+    /// The `InAsyncResponse` Future can be polled to receive the response.
+    ///
+    /// `Res` is the type of a successful response, `E` is the type of an error response.
+    pub fn async<RPC: Rpc, Res: DeserializeOwned, E: DeserializeOwned>
+        (&mut self,
+         rpc: &RPC)
+         -> (OutAsync<W>, InAsyncResponse<R, Res, E>) {
+        let val = RpcVal::new(RPC::names(), RpcType::Async, rpc);
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> RpcSink<W, B> {
-    fn new(ps_sink: PsSink<W, B>) -> RpcSink<W, B> {
-        unimplemented!()
+        let (out_req, in_res) = self.0.request(unwrap_serialize(&val), PacketType::Json);
+        (OutAsync::new(out_req), InAsyncResponse::new(in_res))
+    }
+
+    /// Close the rpc channel, indicating that no more rpcs will be sent.
+    ///
+    /// This does not immediately close if there are still unfinished
+    /// TODO list stuff. In that case, the closing
+    /// happens when the last of them finishes.
+    ///
+    /// The error contains a `None` if an TODO list stuff errored previously.
+    pub fn close(&mut self) -> Poll<(), Option<io::Error>> {
+        self.0.close()
     }
 }
 
-/// A stream for receiving data from the peer.
-pub struct RpcStream<R: AsyncRead> {
-    stream: PsStream<R>,
+
+/// An incoming packet, initiated by the peer.
+pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
+    /// Temporary filler during dev TODO remove this
+    Tmp(R), // /// A source request. You get a sink, the peer got a stream.
+    // Source(RpcSink<W, B>),
+    // /// A sink request. You get a stream, the peer got a sink.
+    // Sink(RpcStream<R>),
+    // /// A duplex request. Both peers get a stream and a sink.
+    // Duplex(RpcSink<W, B>, RpcStream<R>),
+    /// An async request. You get an InAsync, the peer got an InAsyncResponse.
+    Async(InAsync<W>),
+               // /// A sync request. You get an InSync, the peer got an OutSync.
+               // Sync(InSync<W, B>)
 }
 
-impl<R: AsyncRead> RpcStream<R> {
-    fn new(ps_stream: PsStream<R>) -> RpcStream<R> {
-        unimplemented!()
+
+// /// A sink for writing data to the peer.
+// pub struct RpcSink<W: AsyncWrite, B: AsRef<[u8]>> {
+//     sink: PsSink<W, B>,
+// }
+//
+// impl<W: AsyncWrite, B: AsRef<[u8]>> RpcSink<W, B> {
+//     fn new(ps_sink: PsSink<W, B>) -> RpcSink<W, B> {
+//         unimplemented!()
+//     }
+// }
+//
+// /// A stream for receiving data from the peer.
+// pub struct RpcStream<R: AsyncRead> {
+//     stream: PsStream<R>,
+// }
+//
+// impl<R: AsyncRead> RpcStream<R> {
+//     fn new(ps_stream: PsStream<R>) -> RpcStream<R> {
+//         unimplemented!()
+//     }
+// }
+//
+// /// Allows sending a single value to the peer.
+// pub struct InAsync<W: AsyncWrite, B: AsRef<[u8]>> {
+//     in_request: InRequest<W, B>,
+// }
+//
+// impl<W: AsyncWrite, B: AsRef<[u8]>> InAsync<W, B> {
+//     fn new(in_req: InRequest<W, B>) -> InAsync<W, B> {
+//         unimplemented!()
+//     }
+// }
+//
+// /// Allows sending a single value to the peer.
+// pub struct InSync<W: AsyncWrite, B: AsRef<[u8]>> {
+//     in_request: InRequest<W, B>,
+// }
+//
+// impl<W: AsyncWrite, B: AsRef<[u8]>> InSync<W, B> {
+//     fn new(in_req: InRequest<W, B>) -> InSync<W, B> {
+//         unimplemented!()
+//     }
+// }
+
+/// An outgoing async, created by this muxrpc.
+///
+/// Poll it to actually start sending the async.
+pub struct OutAsync<W: AsyncWrite> {
+    out_request: OutRequest<W, Box<[u8]>>,
+}
+
+impl<W: AsyncWrite> OutAsync<W> {
+    fn new(out_request: OutRequest<W, Box<[u8]>>) -> OutAsync<W> {
+        OutAsync { out_request }
     }
 }
 
-/// Allows sending a single value to the peer.
-pub struct InAsync<W: AsyncWrite, B: AsRef<[u8]>> {
-    in_request: InRequest<W, B>,
-}
+impl<W: AsyncWrite> Future for OutAsync<W> {
+    type Item = ();
+    type Error = Option<io::Error>;
 
-impl<W: AsyncWrite, B: AsRef<[u8]>> InAsync<W, B> {
-    fn new(in_req: InRequest<W, B>) -> InAsync<W, B> {
-        unimplemented!()
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.out_request.poll()
     }
 }
 
-/// Allows sending a single value to the peer.
-pub struct InSync<W: AsyncWrite, B: AsRef<[u8]>> {
-    in_request: InRequest<W, B>,
-}
-
-impl<W: AsyncWrite, B: AsRef<[u8]>> InSync<W, B> {
-    fn new(in_req: InRequest<W, B>) -> InSync<W, B> {
-        unimplemented!()
-    }
-}
-
-/// Allows receiving a single value from the peer.
-pub struct OutAsync<R: AsyncRead> {
+/// A response to an async that will be received from the peer.
+pub struct InAsyncResponse<R: AsyncRead, Res, E> {
     in_response: InResponse<R>,
+    _res_type: PhantomData<Res>,
+    _err_type: PhantomData<E>,
 }
 
-/// Allows receiving a single value from the peer.
-pub struct OutSync<R: AsyncRead> {
-    in_response: InResponse<R>,
+
+impl<R: AsyncRead, Res, E> InAsyncResponse<R, Res, E> {
+    fn new(in_response: InResponse<R>) -> InAsyncResponse<R, Res, E> {
+        InAsyncResponse {
+            in_response,
+            _res_type: PhantomData,
+            _err_type: PhantomData,
+        }
+    }
 }
+
+impl<R: AsyncRead, Res: DeserializeOwned, E: DeserializeOwned> Future
+    for InAsyncResponse<R, Res, E> {
+    type Item = Result<Res, E>;
+    type Error = ConnectionRpcError;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let (data, metadata) = try_ready!(self.in_response.poll());
+
+        if metadata.packet_type == PacketType::Json {
+            if metadata.is_end {
+                Ok(Async::Ready(Err(from_slice::<E>(&data)?)))
+            } else {
+                Ok(Async::Ready(Ok(from_slice::<Res>(&data)?)))
+            }
+        } else {
+            Err(ConnectionRpcError::InvalidData)
+        }
+    }
+}
+
+/// An async initiated by the peer. Drop to ignore it, or use `respond` or `respond_err` to send a
+/// response.
+pub struct InAsync<W: AsyncWrite> {
+    in_request: InRequest<W, Box<[u8]>>,
+}
+
+impl<W: AsyncWrite> InAsync<W> {
+    fn new(in_request: InRequest<W, Box<[u8]>>) -> InAsync<W> {
+        InAsync { in_request }
+    }
+
+    /// Send the given response to the peer.
+    pub fn respond<Res: Serialize>(self, res: &Res) -> OutAsyncResponse<W> {
+        OutAsyncResponse::new(self.in_request
+                                  .respond(unwrap_serialize(res),
+                                           Metadata::new(PacketType::Json, false)))
+    }
+
+    /// Send the given error response to the peer.
+    pub fn respond_error<E: Serialize>(self, err: &E) -> OutAsyncResponse<W> {
+        OutAsyncResponse::new(self.in_request
+                                  .respond(unwrap_serialize(err),
+                                           Metadata::new(PacketType::Json, true)))
+    }
+}
+
+/// Future that completes when the async response has been sent to the peer.
+pub struct OutAsyncResponse<W: AsyncWrite> {
+    out_response: OutResponse<W, Box<[u8]>>,
+}
+
+impl<W: AsyncWrite> OutAsyncResponse<W> {
+    fn new(out_response: OutResponse<W, Box<[u8]>>) -> OutAsyncResponse<W> {
+        OutAsyncResponse { out_response }
+    }
+}
+
+impl<W: AsyncWrite> Future for OutAsyncResponse<W> {
+    type Item = ();
+    /// This error contains a `None` if an TODO list muxrpc stuff here
+    type Error = Option<io::Error>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.out_response.poll()
+    }
+}
+
+// TODO declare type synonyms OutResponse<W: AsyncWrite> for OutResponse<W: Box<[u8]>> etc
+
+// TODO break this up into a file per rpc type
+
+// /// Allows receiving a single value from the peer.
+// pub struct OutSync<R: AsyncRead> {
+//     in_response: InResponse<R>,
+// }
+
 
 #[cfg(test)]
 mod tests {
-    #[test] // TODO
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    use super::*;
+
+    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
+    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
+    use quickcheck::{QuickCheck, StdGen};
+    use async_ringbuffer::*;
+    use rand;
+    use futures::stream::iter_ok;
+    use futures::future::{ok, poll_fn};
+
+    #[derive(Serialize)]
+    struct TestRpc([u8; 8]);
+
+    impl Rpc for TestRpc {
+        fn names() -> Box<[&'static str]> {
+            vec!["foo", "bar"].into_boxed_slice()
+        }
+    }
+
+    #[test]
+    fn requests() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_requests as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_requests(buf_size_a: usize,
+                     buf_size_b: usize,
+                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                     -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
+        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+
+        let echo = b_in.for_each(|(names, args, in_rpc)| {
+                assert_eq!(names,
+                           vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
+                match in_rpc {
+                    IncomingRpc::Async(in_async) => {
+                        in_async.respond(&args).map_err(|_| unreachable!())
+                    }
+                    IncomingRpc::Tmp(_) => unreachable!(),                
+                }
+            })
+            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let (req0, res0) = a_out.async::<_, [u8; 8], i32>(&TestRpc([0, 1, 2, 3, 4, 5, 6, 7]));
+        let (req1, res1) = a_out.async::<_, [u8; 8], i32>(&TestRpc([8, 9, 10, 11, 12, 13, 14, 15]));
+        let (req2, res2) = a_out.async::<_, [u8; 8], i32>(&TestRpc([16, 17, 18, 19, 20, 21, 22,
+                                                                    23]));
+
+        let send_all = req0.join3(req1, req2)
+            .and_then(|_| poll_fn(|| a_out.close()));
+
+        let receive_all = res0.join3(res1, res2)
+            .map(|(r0_data, r1_data, r2_data)| {
+                     return r0_data.is_ok() && r0_data.ok().unwrap() == [0, 1, 2, 3, 4, 5, 6, 7] &&
+                            r1_data.ok().unwrap() == [8, 9, 10, 11, 12, 13, 14, 15] &&
+                            r2_data.ok().unwrap() == [16, 17, 18, 19, 20, 21, 22, 23];
+                 });
+
+        return echo.join4(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()),
+                          receive_all.map_err(|_| unreachable!()))
+                   .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
     }
 }
