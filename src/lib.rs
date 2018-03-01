@@ -19,6 +19,8 @@ extern crate async_ringbuffer;
 #[cfg(test)]
 extern crate rand;
 
+mod async;
+
 use std::convert::From;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -36,18 +38,21 @@ use serde_json::error::Error as SerdeError;
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 
+use async::{new_in_async, new_out_async, new_in_async_response};
+pub use async::{OutAsync, OutAsyncResponse, InAsync, InAsyncResponse};
+
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
-struct RpcVal<'a, 'b, A: 'b> {
+struct OutRpc<'a, 'b, A: 'b> {
     name: Box<[&'a str]>,
     #[serde(rename = "type")]
     type_: RpcType,
     args: &'b A,
 }
 
-impl<'a, 'b, A: Serialize + 'b> RpcVal<'a, 'b, A> {
-    fn new(name: Box<[&'a str]>, type_: RpcType, args: &'b A) -> RpcVal<'a, 'b, A> {
-        RpcVal { name, type_, args }
+impl<'a, 'b, A: Serialize + 'b> OutRpc<'a, 'b, A> {
+    fn new(name: Box<[&'a str]>, type_: RpcType, args: &'b A) -> OutRpc<'a, 'b, A> {
+        OutRpc { name, type_, args }
     }
 }
 
@@ -254,7 +259,7 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                                 RpcType::Async => {
                                     Ok(Async::Ready(Some((rpc.name,
                                                           rpc.args,
-                                                          IncomingRpc::Async(InAsync::new(req))))))
+                                                          IncomingRpc::Async(new_in_async(req))))))
                                 }
                                 _ => Err(RpcError::InvalidData),
                             }
@@ -359,10 +364,11 @@ impl<R, W> RpcOut<R, W>
         (&mut self,
          rpc: &RPC)
          -> (OutAsync<W>, InAsyncResponse<R, Res, E>) {
-        let val = RpcVal::new(RPC::names(), RpcType::Async, rpc);
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Async, rpc);
 
-        let (out_req, in_res) = self.0.request(unwrap_serialize(&val), PacketType::Json);
-        (OutAsync::new(out_req), InAsyncResponse::new(in_res))
+        let (out_req, in_res) = self.0
+            .request(unwrap_serialize(&out_rpc), PacketType::Json);
+        (new_out_async(out_req), new_in_async_response(in_res))
     }
 
     /// Close the rpc channel, indicating that no more rpcs will be sent.
@@ -437,117 +443,6 @@ pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
 //         unimplemented!()
 //     }
 // }
-
-/// An outgoing async, created by this muxrpc.
-///
-/// Poll it to actually start sending the async.
-pub struct OutAsync<W: AsyncWrite> {
-    out_request: OutRequest<W, Box<[u8]>>,
-}
-
-impl<W: AsyncWrite> OutAsync<W> {
-    fn new(out_request: OutRequest<W, Box<[u8]>>) -> OutAsync<W> {
-        OutAsync { out_request }
-    }
-}
-
-impl<W: AsyncWrite> Future for OutAsync<W> {
-    type Item = ();
-    type Error = Option<io::Error>;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.out_request.poll()
-    }
-}
-
-/// A response to an async that will be received from the peer.
-pub struct InAsyncResponse<R: AsyncRead, Res, E> {
-    in_response: InResponse<R>,
-    _res_type: PhantomData<Res>,
-    _err_type: PhantomData<E>,
-}
-
-
-impl<R: AsyncRead, Res, E> InAsyncResponse<R, Res, E> {
-    fn new(in_response: InResponse<R>) -> InAsyncResponse<R, Res, E> {
-        InAsyncResponse {
-            in_response,
-            _res_type: PhantomData,
-            _err_type: PhantomData,
-        }
-    }
-}
-
-impl<R: AsyncRead, Res: DeserializeOwned, E: DeserializeOwned> Future
-    for InAsyncResponse<R, Res, E> {
-    type Item = Result<Res, E>;
-    type Error = ConnectionRpcError;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let (data, metadata) = try_ready!(self.in_response.poll());
-
-        if metadata.packet_type == PacketType::Json {
-            if metadata.is_end {
-                Ok(Async::Ready(Err(from_slice::<E>(&data)?)))
-            } else {
-                Ok(Async::Ready(Ok(from_slice::<Res>(&data)?)))
-            }
-        } else {
-            Err(ConnectionRpcError::InvalidData)
-        }
-    }
-}
-
-/// An async initiated by the peer. Drop to ignore it, or use `respond` or `respond_err` to send a
-/// response.
-pub struct InAsync<W: AsyncWrite> {
-    in_request: InRequest<W, Box<[u8]>>,
-}
-
-impl<W: AsyncWrite> InAsync<W> {
-    fn new(in_request: InRequest<W, Box<[u8]>>) -> InAsync<W> {
-        InAsync { in_request }
-    }
-
-    /// Send the given response to the peer.
-    pub fn respond<Res: Serialize>(self, res: &Res) -> OutAsyncResponse<W> {
-        OutAsyncResponse::new(self.in_request
-                                  .respond(unwrap_serialize(res),
-                                           Metadata::new(PacketType::Json, false)))
-    }
-
-    /// Send the given error response to the peer.
-    pub fn respond_error<E: Serialize>(self, err: &E) -> OutAsyncResponse<W> {
-        OutAsyncResponse::new(self.in_request
-                                  .respond(unwrap_serialize(err),
-                                           Metadata::new(PacketType::Json, true)))
-    }
-}
-
-/// Future that completes when the async response has been sent to the peer.
-pub struct OutAsyncResponse<W: AsyncWrite> {
-    out_response: OutResponse<W, Box<[u8]>>,
-}
-
-impl<W: AsyncWrite> OutAsyncResponse<W> {
-    fn new(out_response: OutResponse<W, Box<[u8]>>) -> OutAsyncResponse<W> {
-        OutAsyncResponse { out_response }
-    }
-}
-
-impl<W: AsyncWrite> Future for OutAsyncResponse<W> {
-    type Item = ();
-    /// This error contains a `None` if an TODO list muxrpc stuff here
-    type Error = Option<io::Error>;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.out_response.poll()
-    }
-}
-
-// TODO declare type synonyms OutResponse<W: AsyncWrite> for OutResponse<W: Box<[u8]>> etc
-
-// TODO break this up into a file per rpc type
 
 // /// Allows receiving a single value from the peer.
 // pub struct OutSync<R: AsyncRead> {
