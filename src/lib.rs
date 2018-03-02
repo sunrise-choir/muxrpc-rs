@@ -257,7 +257,7 @@ impl<R, W> RpcOut<R, W>
     where R: AsyncRead,
           W: AsyncWrite
 {
-    /// Send an async to the peer.
+    /// Send an async request to the peer.
     ///
     /// The `OutAsync` Future must be polled to actually start sending the request.
     /// The `InAsyncResponse` Future can be polled to receive the response.
@@ -274,6 +274,28 @@ impl<R, W> RpcOut<R, W>
         (new_out_async(out_req), new_in_async_response(in_res))
     }
 
+    // TODO sync
+
+    /// Send a source request to the peer.
+    ///
+    /// The `OutSource` Future must be polled to actually start sending the request.
+    /// The `InStream` can be polled to receive the responses.
+    ///
+    /// `I` is the type of the responses, `E` is the type of an error response.
+    pub fn source<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
+        (&mut self,
+         rpc: &RPC)
+         -> (OutSource<W>, InStream<R, I, E>) {
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Source, rpc);
+
+        let (ps_sink, ps_stream) = self.0.duplex();
+        // TODO send initial msg down the ps_sink (as part of the OutSource)
+        (new_out_source(ps_sink, out_rpc), new_in_stream(ps_stream))
+        // TODO OutSource future should yield CancelSource future
+    }
+
+    // TODO stream
+    // TODO duplex
     /// Close the rpc channel, indicating that no more rpcs will be sent.
     ///
     /// This does not immediately close if there are still unfinished
@@ -430,9 +452,9 @@ mod tests {
 
         let receive_all = res0.join3(res1, res2)
             .map(|(r0_data, r1_data, r2_data)| {
-                     return r0_data.is_ok() && r0_data.ok().unwrap() == [0, 1, 2, 3, 4, 5, 6, 7] &&
-                            r1_data.ok().unwrap() == [8, 9, 10, 11, 12, 13, 14, 15] &&
-                            r2_data.ok().unwrap() == [16, 17, 18, 19, 20, 21, 22, 23];
+                     return r0_data == [0, 1, 2, 3, 4, 5, 6, 7] &&
+                            r1_data == [8, 9, 10, 11, 12, 13, 14, 15] &&
+                            r2_data == [16, 17, 18, 19, 20, 21, 22, 23];
                  });
 
         return echo.join4(consume_a.map_err(|_| unreachable!()),

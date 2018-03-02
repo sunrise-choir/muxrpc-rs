@@ -1,11 +1,12 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
-use std::marker::PhantomData;
 
+use serde::de::DeserializeOwned;
 use serde_json::error::Error as SerdeError;
 use packet_stream::ConnectionError;
 
+// TODO does this need a PeerError variant?
 /// An error that can be emitted during the rpc process.
 #[derive(Debug)]
 pub enum RpcError {
@@ -59,7 +60,9 @@ impl From<SerdeError> for RpcError {
 
 /// An error that can be emitted during the rpc process when receiving multiplexed data.
 #[derive(Debug)]
-pub enum ConnectionRpcError {
+pub enum ConnectionRpcError<E> {
+    /// An error signaled by the peer via the muxrpc protocol.
+    PeerError(E),
     /// A `ConnectionError` occured.
     ConnectionError(ConnectionError),
     /// Received a packet containing invalid data.
@@ -70,9 +73,12 @@ pub enum ConnectionRpcError {
     InvalidData,
 }
 
-impl Display for ConnectionRpcError {
+impl<E: Display> Display for ConnectionRpcError<E> {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
         match *self {
+            ConnectionRpcError::PeerError(ref err) => {
+                write!(f, "Connection rpc error: Peer error: {}", err)
+            }
             ConnectionRpcError::ConnectionError(ref err) => {
                 write!(f, "Connection rpc error: {}", err)
             }
@@ -81,23 +87,24 @@ impl Display for ConnectionRpcError {
     }
 }
 
-impl Error for ConnectionRpcError {
+impl<E: Error> Error for ConnectionRpcError<E> {
     fn description(&self) -> &str {
         match *self {
+            ConnectionRpcError::PeerError(ref err) => err.description(),
             ConnectionRpcError::ConnectionError(ref err) => err.description(),
             ConnectionRpcError::InvalidData => "Received a packet that contained invalid data",
         }
     }
 }
 
-impl From<ConnectionError> for ConnectionRpcError {
-    fn from(err: ConnectionError) -> ConnectionRpcError {
+impl<E> From<ConnectionError> for ConnectionRpcError<E> {
+    fn from(err: ConnectionError) -> ConnectionRpcError<E> {
         ConnectionRpcError::ConnectionError(err)
     }
 }
 
-impl From<SerdeError> for ConnectionRpcError {
-    fn from(err: SerdeError) -> ConnectionRpcError {
+impl<E> From<SerdeError> for ConnectionRpcError<E> {
+    fn from(err: SerdeError) -> ConnectionRpcError<E> {
         ConnectionRpcError::InvalidData
     }
 }

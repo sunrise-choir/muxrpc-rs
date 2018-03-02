@@ -53,17 +53,17 @@ pub fn new_in_async_response<R: AsyncRead, Res, E>(in_response: InResponse<R>)
 
 impl<R: AsyncRead, Res: DeserializeOwned, E: DeserializeOwned> Future
     for InAsyncResponse<R, Res, E> {
-    type Item = Result<Res, E>;
-    type Error = ConnectionRpcError;
+    type Item = Res;
+    type Error = ConnectionRpcError<E>;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         let (data, metadata) = try_ready!(self.in_response.poll());
 
         if metadata.packet_type == PacketType::Json {
             if metadata.is_end {
-                Ok(Async::Ready(Err(from_slice::<E>(&data)?)))
+                Err(ConnectionRpcError::PeerError(from_slice::<E>(&data)?))
             } else {
-                Ok(Async::Ready(Ok(from_slice::<Res>(&data)?)))
+                Ok(Async::Ready(from_slice::<Res>(&data)?))
             }
         } else {
             Err(ConnectionRpcError::InvalidData)
