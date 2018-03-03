@@ -21,9 +21,10 @@ extern crate async_ringbuffer;
 extern crate rand;
 
 mod errors;
+mod common;
 mod async;
 mod source;
-mod common;
+mod sink;
 
 use std::convert::From;
 use std::fmt::{Display, Formatter};
@@ -45,6 +46,8 @@ use async::{new_in_async, new_out_async, new_in_async_response};
 pub use async::{OutAsync, OutAsyncResponse, InAsync, InAsyncResponse};
 use source::{new_rpc_stream, new_out_source, new_out_source_cancelable};
 pub use source::{OutSource, OutSourceCancelable, RpcStream, CancelSource};
+use sink::{new_out_sink, new_rpc_sink};
+pub use sink::{OutSink, RpcSink};
 
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -178,7 +181,7 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
 
                         IncomingPacket::Duplex(ps_sink, ps_stream) => {
                             match rpc.type_ {
-                                RpcType::Source => unimplemented!(),
+                                RpcType::Source => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Source(new_rpc_sink(ps_sink)))))),
 
                                 RpcType::Sink => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Sink(new_rpc_stream(ps_stream)))))),
 
@@ -328,7 +331,17 @@ impl<R, W> RpcOut<R, W>
         (new_out_source_cancelable(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
-    // TODO stream
+    /// Send a sink request to the peer.
+    ///
+    /// The `OutSink` Future must be polled to actually start sending the request, and it yields
+    /// a sink for sending more data to the peer.
+    pub fn sink<RPC: Rpc>(&mut self, rpc: &RPC) -> OutSink<W> {
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Sink, rpc);
+
+        let (ps_sink, _) = self.0.duplex();
+        new_out_sink(ps_sink, unwrap_serialize(&out_rpc))
+    }
+
     // TODO duplex
     /// Close the rpc channel, indicating that no more rpcs will be sent.
     ///
@@ -345,8 +358,8 @@ impl<R, W> RpcOut<R, W>
 
 /// An incoming packet, initiated by the peer.
 pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
-    // /// A source request. You get a sink, the peer got a stream.
-    // Source(RpcSink<W>),
+    /// A source request. You get a sink, the peer got a stream.
+    Source(RpcSink<W>),
     /// A sink request. You get a stream, the peer got a sink.
     Sink(RpcStream<R, Value, Value>),
     // /// A duplex request. Both peers get a stream and a sink.
@@ -430,10 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn requests() {
+    fn async() {
         let rng = StdGen::new(rand::thread_rng(), 20);
         let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_requests as
+        quickcheck.quickcheck(test_async as
                               fn(usize,
                                  usize,
                                  PartialWithErrors<GenInterruptedWouldBlock>,
@@ -443,13 +456,13 @@ mod tests {
                                  -> bool);
     }
 
-    fn test_requests(buf_size_a: usize,
-                     buf_size_b: usize,
-                     write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                     write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                     read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                     -> bool {
+    fn test_async(buf_size_a: usize,
+                  buf_size_b: usize,
+                  write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                  read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                  write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                  read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                  -> bool {
         let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
         let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
         let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
@@ -468,7 +481,7 @@ mod tests {
                     IncomingRpc::Async(in_async) => {
                         in_async.respond(&args).map_err(|_| unreachable!())
                     }
-                    IncomingRpc::Sink(_) => unreachable!(),                
+                    _ => unreachable!(),                
                 }
             })
             .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
@@ -494,6 +507,83 @@ mod tests {
                           send_all.map_err(|_| unreachable!()),
                           receive_all.map_err(|_| unreachable!()))
                    .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
+    }
+
+    #[test]
+    fn sink() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_sink as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_sink(buf_size_a: usize,
+                 buf_size_b: usize,
+                 write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                 read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                 write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                 read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                 -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
+        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+
+        let echo = b_in.fold(true, |acc, (names, args, in_rpc)| {
+                assert_eq!(names,
+                           vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
+                match in_rpc {
+                    IncomingRpc::Sink(rpc_stream) => {
+                        rpc_stream
+                            .collect()
+                            .map(move |data| {
+                                     acc && data == vec![Value::Bool(true), Value::Bool(false)]
+                                 })
+                            .map_err(|_| RpcError::InvalidData)
+                    }
+                    _ => unreachable!(),                
+                }
+            })
+            .and_then(|worked| {
+                          poll_fn(|| b_out.close())
+                              .map(move |_| worked)
+                              .map_err(|_| unreachable!())
+                      });
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let out_sink0 = a_out.sink(&TestRpc([0, 1, 2, 3, 4, 5, 6, 7]));
+        let out0 =
+            out_sink0.and_then(|rpc_sink| {
+                                   rpc_sink.send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
+                                                                          Ok(Value::Bool(false))]))
+                               });
+        let out_sink1 = a_out.sink(&TestRpc([0, 1, 2, 3, 4, 5, 6, 99]));
+        let out1 =
+            out_sink1.and_then(|rpc_sink| {
+                                   rpc_sink.send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
+                                                                          Ok(Value::Bool(false))]))
+                               });
+
+        let send_all = out0.join(out1).and_then(|_| poll_fn(|| a_out.close()));
+
+        return echo.join3(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()))
+                   .map(|(worked, _, _)| worked)
                    .wait()
                    .unwrap();
     }

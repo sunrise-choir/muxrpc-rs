@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use futures::prelude::*;
 use tokio_io::{AsyncRead, AsyncWrite};
-use packet_stream::{InRequest, InResponse, PacketType, OutRequest, OutResponse, Metadata};
+use packet_stream::{InRequest, InResponse, PacketType, OutRequest, OutResponse};
 use serde_json::from_slice;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -85,15 +85,12 @@ impl<W: AsyncWrite> InAsync<W> {
     /// Send the given response to the peer.
     pub fn respond<Res: Serialize>(self, res: &Res) -> OutAsyncResponse<W> {
         OutAsyncResponse::new(self.in_request
-                                  .respond(unwrap_serialize(res),
-                                           Metadata::new(PacketType::Json, false)))
+                                  .respond(unwrap_serialize(res), META_NON_END))
     }
 
     /// Send the given error response to the peer.
     pub fn respond_error<E: Serialize>(self, err: &E) -> OutAsyncResponse<W> {
-        OutAsyncResponse::new(self.in_request
-                                  .respond(unwrap_serialize(err),
-                                           Metadata::new(PacketType::Json, true)))
+        OutAsyncResponse::new(self.in_request.respond(unwrap_serialize(err), META_END))
     }
 }
 
