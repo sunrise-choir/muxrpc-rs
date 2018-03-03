@@ -2,7 +2,6 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 
-use serde::de::DeserializeOwned;
 use serde_json::error::Error as SerdeError;
 use packet_stream::ConnectionError;
 

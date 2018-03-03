@@ -1,6 +1,7 @@
 //! Implements the [muxrpc protocol](https://github.com/ssbc/muxrpc) in rust.
 #![deny(missing_docs)]
 
+extern crate atm_async_utils;
 #[macro_use]
 extern crate futures;
 extern crate packet_stream;
@@ -21,6 +22,8 @@ extern crate rand;
 
 mod errors;
 mod async;
+mod source;
+mod common;
 
 use std::convert::From;
 use std::fmt::{Display, Formatter};
@@ -30,15 +33,18 @@ use futures::prelude::*;
 use futures::unsync::oneshot::Canceled;
 use tokio_io::{AsyncRead, AsyncWrite};
 use packet_stream::{packet_stream, PsIn, PsOut, ConnectionError, PsSink, PsStream, InRequest,
-                    InResponse, IncomingPacket, PacketType, OutRequest, OutResponse, Metadata};
+                    InResponse, IncomingPacket, PacketType, OutRequest, OutResponse};
 use serde_json::Value;
 use serde_json::{to_vec, from_slice};
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 
 pub use errors::*;
+use common::*;
 use async::{new_in_async, new_out_async, new_in_async_response};
 pub use async::{OutAsync, OutAsyncResponse, InAsync, InAsyncResponse};
+use source::{new_rpc_stream, new_out_source, new_out_source_cancelable};
+pub use source::{OutSource, OutSourceCancelable, RpcStream, CancelSource};
 
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -159,16 +165,28 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                         IncomingPacket::Request(req) => {
                             match rpc.type_ {
                                 RpcType::Sync => unimplemented!(),
+
                                 RpcType::Async => {
                                     Ok(Async::Ready(Some((rpc.name,
                                                           rpc.args,
                                                           IncomingRpc::Async(new_in_async(req))))))
                                 }
+
                                 _ => Err(RpcError::InvalidData),
                             }
                         }
 
-                        IncomingPacket::Duplex(ps_sink, ps_stream) => unimplemented!(),
+                        IncomingPacket::Duplex(ps_sink, ps_stream) => {
+                            match rpc.type_ {
+                                RpcType::Source => unimplemented!(),
+
+                                RpcType::Sink => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Sink(new_rpc_stream(ps_stream)))))),
+
+                                RpcType::Duplex => unimplemented!(),
+
+                                _ => Err(RpcError::InvalidData),
+                            }
+                        }
                     }
                 } else {
                     Err(RpcError::InvalidData)
@@ -279,19 +297,35 @@ impl<R, W> RpcOut<R, W>
     /// Send a source request to the peer.
     ///
     /// The `OutSource` Future must be polled to actually start sending the request.
-    /// The `InStream` can be polled to receive the responses.
+    /// The `InSink` can be polled to receive the responses.
     ///
     /// `I` is the type of the responses, `E` is the type of an error response.
     pub fn source<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutSource<W>, InStream<R, I, E>) {
+         -> (OutSource<W>, RpcStream<R, I, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Source, rpc);
 
         let (ps_sink, ps_stream) = self.0.duplex();
-        // TODO send initial msg down the ps_sink (as part of the OutSource)
-        (new_out_source(ps_sink, out_rpc), new_in_stream(ps_stream))
-        // TODO OutSource future should yield CancelSource future
+        (new_out_source(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
+    }
+
+    /// Send a source request to the peer, that may be cancelled at any time.
+    ///
+    /// The `OutSource` Future must be polled to actually start sending the request, and it yields
+    /// a handle for cancelling the source. Note that if the handle is not used for cancelling, it
+    /// *must* still be closed.
+    /// The `InSink` can be polled to receive the responses.
+    ///
+    /// `I` is the type of the responses, `E` is the type of an error response.
+    pub fn source_cancelable<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
+        (&mut self,
+         rpc: &RPC)
+         -> (OutSourceCancelable<W>, RpcStream<R, I, E>) {
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Source, rpc);
+
+        let (ps_sink, ps_stream) = self.0.duplex();
+        (new_out_source_cancelable(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
     // TODO stream
@@ -311,11 +345,10 @@ impl<R, W> RpcOut<R, W>
 
 /// An incoming packet, initiated by the peer.
 pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
-    /// Temporary filler during dev TODO remove this
-    Tmp(R), // /// A source request. You get a sink, the peer got a stream.
-    // Source(RpcSink<W, B>),
-    // /// A sink request. You get a stream, the peer got a sink.
-    // Sink(RpcStream<R>),
+    // /// A source request. You get a sink, the peer got a stream.
+    // Source(RpcSink<W>),
+    /// A sink request. You get a stream, the peer got a sink.
+    Sink(RpcStream<R, Value, Value>),
     // /// A duplex request. Both peers get a stream and a sink.
     // Duplex(RpcSink<W, B>, RpcStream<R>),
     /// An async request. You get an InAsync, the peer got an InAsyncResponse.
@@ -435,7 +468,7 @@ mod tests {
                     IncomingRpc::Async(in_async) => {
                         in_async.respond(&args).map_err(|_| unreachable!())
                     }
-                    IncomingRpc::Tmp(_) => unreachable!(),                
+                    IncomingRpc::Sink(_) => unreachable!(),                
                 }
             })
             .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
