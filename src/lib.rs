@@ -587,4 +587,75 @@ mod tests {
                    .wait()
                    .unwrap();
     }
+
+    #[test]
+    fn source() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_source as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_source(buf_size_a: usize,
+                   buf_size_b: usize,
+                   write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                   read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                   write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                   read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                   -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
+        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+
+        let echo = b_in.for_each(|(names, args, in_rpc)| {
+                assert_eq!(names,
+                           vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
+                match in_rpc {
+                    IncomingRpc::Source(rpc_sink) => {
+                        rpc_sink
+                            .send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
+                                                                           Ok(Value::Bool(false))]))
+                            .map_err(|_| unimplemented!())
+                            .map(|_| ())
+                    }
+                    _ => unreachable!(),                
+                }
+            })
+            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let (out_source0, stream0) =
+            a_out.source::<_, bool, i32>(&TestRpc([0, 1, 2, 3, 4, 5, 6, 7]));
+        let stream0 = stream0.collect().map(|data| data == vec![true, false]);
+
+        let (out_source1, stream1) =
+            a_out.source::<_, bool, i32>(&TestRpc([0, 1, 2, 3, 4, 5, 6, 99]));
+        let stream1 = stream1.collect().map(|data| data == vec![true, false]);
+
+        let send_all = out_source0
+            .join(out_source1)
+            .and_then(|_| poll_fn(|| a_out.close()));
+        let process_all = stream0.join(stream1);
+
+        return echo.join4(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()),
+                          process_all.map_err(|_| unreachable!()))
+                   .map(|(_, _, _, (worked0, worked1))| worked0 && worked1)
+                   .wait()
+                   .unwrap();
+    }
 }
