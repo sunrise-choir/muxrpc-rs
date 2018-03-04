@@ -5,7 +5,6 @@ use std::io;
 use serde_json::error::Error as SerdeError;
 use packet_stream::ConnectionError;
 
-// TODO does this need a PeerError variant?
 /// An error that can be emitted during the rpc process.
 #[derive(Debug)]
 pub enum RpcError {
@@ -52,7 +51,7 @@ impl From<io::Error> for RpcError {
 }
 
 impl From<SerdeError> for RpcError {
-    fn from(err: SerdeError) -> RpcError {
+    fn from(_: SerdeError) -> RpcError {
         RpcError::InvalidData
     }
 }
@@ -103,7 +102,7 @@ impl<E> From<ConnectionError> for ConnectionRpcError<E> {
 }
 
 impl<E> From<SerdeError> for ConnectionRpcError<E> {
-    fn from(err: SerdeError) -> ConnectionRpcError<E> {
+    fn from(_: SerdeError) -> ConnectionRpcError<E> {
         ConnectionRpcError::InvalidData
     }
 }

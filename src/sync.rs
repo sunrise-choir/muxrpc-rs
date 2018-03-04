@@ -107,7 +107,6 @@ impl<W: AsyncWrite> OutSyncResponse<W> {
 
 impl<W: AsyncWrite> Future for OutSyncResponse<W> {
     type Item = ();
-    /// This error contains a `None` if an TODO list muxrpc stuff here
     type Error = Option<io::Error>;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {

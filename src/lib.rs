@@ -1,4 +1,7 @@
 //! Implements the [muxrpc protocol](https://github.com/ssbc/muxrpc) in rust.
+//!
+//! All futures, sinks and streams with an error type of `Option<io::Error>` use `None` to signal
+//! that an error happend on the underlying transport, but on another handle to the transport.
 #![deny(missing_docs)]
 
 extern crate atm_async_utils;
@@ -29,17 +32,15 @@ mod sink;
 mod duplex;
 
 use std::convert::From;
-use std::fmt::{Display, Formatter};
 use std::io;
 
 use futures::prelude::*;
 use futures::unsync::oneshot::Canceled;
 use tokio_io::{AsyncRead, AsyncWrite};
-use packet_stream::{packet_stream, PsIn, PsOut, ConnectionError, PsSink, PsStream, InRequest,
-                    InResponse, IncomingPacket, PacketType, OutRequest, OutResponse};
+use packet_stream::{packet_stream, PsIn, PsOut, IncomingPacket, PacketType, ClosePs};
 use serde_json::Value;
 use serde_json::{to_vec, from_slice};
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub use errors::*;
@@ -79,12 +80,6 @@ struct InRpc {
     args: Box<[Value]>,
 }
 
-const SOURCE: &'static str = "source";
-const SINK: &'static str = "sink";
-const DUPLEX: &'static str = "duplex";
-const ASYNC: &'static str = "async";
-const SYNC: &'static str = "sync";
-
 // The different rpc types.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,25 +89,6 @@ enum RpcType {
     Duplex,
     Async,
     Sync,
-}
-
-impl RpcType {
-    fn needs_stream_flag(&self) -> bool {
-        match *self {
-            RpcType::Source | RpcType::Sink | RpcType::Duplex => true,
-            RpcType::Async | RpcType::Sync => false,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match *self {
-            RpcType::Source => SOURCE,
-            RpcType::Sink => SINK,
-            RpcType::Duplex => DUPLEX,
-            RpcType::Async => ASYNC,
-            RpcType::Sync => SYNC,
-        }
-    }
 }
 
 /// Implementors of this trait are rpcs that can be sent to the peer. The serilize implementation
@@ -128,8 +104,9 @@ pub struct Closed<W>(packet_stream::Closed<W, Box<[u8]>>);
 
 impl<W> Future for Closed<W> {
     type Item = W;
-    /// This can only be emitted if a previously polled/written `OutRequest`,
-    /// `OutResponse`s or `PsSink` is dropped whithout waiting for it to finish. TODO put muxrpc stuff here
+    /// This can only be emitted if a handle to the underlying transport has been polled but was
+    /// dropped before it was done. If all handles are polled/closed properly, this error is never
+    /// emitted.
     type Error = Canceled;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
@@ -325,12 +302,25 @@ impl<R, W> RpcOut<R, W>
         (new_out_duplex(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
-    /// The error contains a `None` if an TODO list stuff errored previously.
-    pub fn close(&mut self) -> Poll<(), Option<io::Error>> {
-        self.0.close()
+    /// Close the muxrpc session. If there are still active handles to the underlying transport,
+    /// it is not closed immediately. It will get closed once the last of them is done.
+    pub fn close(self) -> CloseRpc<R, W> {
+        CloseRpc(self.0.close())
     }
 }
 
+/// A future for closing the muxrpc session. If there are still active handles to the underlying transport,
+/// it is not closed immediately. It will get closed once the last of them is done.
+pub struct CloseRpc<R: AsyncRead, W>(ClosePs<R, W, Box<[u8]>>);
+
+impl<R: AsyncRead, W: AsyncWrite> Future for CloseRpc<R, W> {
+    type Item = ();
+    type Error = Option<io::Error>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.0.poll()
+    }
+}
 
 /// An incoming packet, initiated by the peer.
 pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
@@ -356,7 +346,7 @@ mod tests {
     use async_ringbuffer::*;
     use rand;
     use futures::stream::iter_ok;
-    use futures::future::{ok, poll_fn};
+    use futures::future::ok;
 
     #[derive(Serialize)]
     struct TestRpc([u8; 8]);
@@ -397,7 +387,7 @@ mod tests {
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
-        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+        let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
 
         let echo = b_in.for_each(|(names, args, in_rpc)| {
                 assert_eq!(names,
@@ -409,7 +399,7 @@ mod tests {
                     _ => unreachable!(),                
                 }
             })
-            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+            .and_then(|_| b_out.close().map_err(|_| unreachable!()));
 
         let consume_a = a_in.for_each(|_| ok(()));
 
@@ -418,8 +408,7 @@ mod tests {
         let (req2, res2) = a_out.async::<_, [u8; 8], i32>(&TestRpc([16, 17, 18, 19, 20, 21, 22,
                                                                     23]));
 
-        let send_all = req0.join3(req1, req2)
-            .and_then(|_| poll_fn(|| a_out.close()));
+        let send_all = req0.join3(req1, req2).and_then(|_| a_out.close());
 
         let receive_all = res0.join3(res1, res2)
             .map(|(r0_data, r1_data, r2_data)| {
@@ -466,7 +455,7 @@ mod tests {
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
-        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+        let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
 
         let echo = b_in.for_each(|(names, args, in_rpc)| {
                 assert_eq!(names,
@@ -478,7 +467,7 @@ mod tests {
                     _ => unreachable!(),                
                 }
             })
-            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+            .and_then(|_| b_out.close().map_err(|_| unreachable!()));
 
         let consume_a = a_in.for_each(|_| ok(()));
 
@@ -487,8 +476,7 @@ mod tests {
         let (req2, res2) = a_out.sync::<_, [u8; 8], i32>(&TestRpc([16, 17, 18, 19, 20, 21, 22,
                                                                    23]));
 
-        let send_all = req0.join3(req1, req2)
-            .and_then(|_| poll_fn(|| a_out.close()));
+        let send_all = req0.join3(req1, req2).and_then(|_| a_out.close());
 
         let receive_all = res0.join3(res1, res2)
             .map(|(r0_data, r1_data, r2_data)| {
@@ -535,9 +523,9 @@ mod tests {
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
-        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+        let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
 
-        let echo = b_in.fold(true, |acc, (names, args, in_rpc)| {
+        let echo = b_in.fold(true, |acc, (names, _, in_rpc)| {
                 assert_eq!(names,
                            vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
                 match in_rpc {
@@ -553,7 +541,8 @@ mod tests {
                 }
             })
             .and_then(|worked| {
-                          poll_fn(|| b_out.close())
+                          b_out
+                              .close()
                               .map(move |_| worked)
                               .map_err(|_| unreachable!())
                       });
@@ -573,7 +562,7 @@ mod tests {
                                                                           Ok(Value::Bool(false))]))
                                });
 
-        let send_all = out0.join(out1).and_then(|_| poll_fn(|| a_out.close()));
+        let send_all = out0.join(out1).and_then(|_| a_out.close());
 
         return echo.join3(consume_a.map_err(|_| unreachable!()),
                           send_all.map_err(|_| unreachable!()))
@@ -612,9 +601,9 @@ mod tests {
         let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
-        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+        let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
 
-        let echo = b_in.for_each(|(names, args, in_rpc)| {
+        let echo = b_in.for_each(|(names, _, in_rpc)| {
                 assert_eq!(names,
                            vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
                 match in_rpc {
@@ -622,13 +611,13 @@ mod tests {
                         rpc_sink
                             .send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
                                                                            Ok(Value::Bool(false))]))
-                            .map_err(|_| unimplemented!())
+                            .map_err(|_| unreachable!())
                             .map(|_| ())
                     }
                     _ => unreachable!(),                
                 }
             })
-            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+            .and_then(|_| b_out.close().map_err(|_| unreachable!()));
 
         let consume_a = a_in.for_each(|_| ok(()));
 
@@ -640,9 +629,7 @@ mod tests {
             a_out.source::<_, bool, i32>(&TestRpc([0, 1, 2, 3, 4, 5, 6, 99]));
         let stream1 = stream1.collect().map(|data| data == vec![true, false]);
 
-        let send_all = out_source0
-            .join(out_source1)
-            .and_then(|_| poll_fn(|| a_out.close()));
+        let send_all = out_source0.join(out_source1).and_then(|_| a_out.close());
         let process_all = stream0.join(stream1);
 
         return echo.join4(consume_a.map_err(|_| unreachable!()),

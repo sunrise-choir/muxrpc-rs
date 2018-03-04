@@ -1,13 +1,10 @@
 use std::convert::From;
 use std::io;
 
-use atm_async_utils::sink_futures::{Close, SendClose};
 use futures::prelude::*;
 use futures::sink::Send;
-use tokio_io::{AsyncRead, AsyncWrite};
-use packet_stream::{PsSink, PsStream, PacketType, Metadata};
-use serde_json::from_slice;
-use serde::de::DeserializeOwned;
+use tokio_io::AsyncWrite;
+use packet_stream::PsSink;
 
 use super::*;
 
