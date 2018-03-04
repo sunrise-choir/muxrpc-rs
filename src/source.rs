@@ -155,7 +155,7 @@ impl<R: AsyncRead, I: DeserializeOwned, E: DeserializeOwned> Stream for RpcStrea
                 Ok(Async::Ready(Some(from_slice::<I>(&data)?)))
             }
         } else {
-            Err(ConnectionRpcError::InvalidData)
+            Err(ConnectionRpcError::NotJson)
         }
     }
 }

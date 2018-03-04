@@ -66,7 +66,7 @@ impl<R: AsyncRead, Res: DeserializeOwned, E: DeserializeOwned> Future
                 Ok(Async::Ready(from_slice::<Res>(&data)?))
             }
         } else {
-            Err(ConnectionRpcError::InvalidData)
+            Err(ConnectionRpcError::NotJson)
         }
     }
 }

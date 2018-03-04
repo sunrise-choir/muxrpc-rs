@@ -162,7 +162,7 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                                                           IncomingRpc::Async(new_in_async(req))))))
                                 }
 
-                                _ => Err(RpcError::InvalidData),
+                                _ => Err(RpcError::NotJson),
                             }
                         }
 
@@ -174,12 +174,12 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
 
                                 RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Duplex(new_rpc_sink(ps_sink), new_rpc_stream(ps_stream)))))),
 
-                                _ => Err(RpcError::InvalidData),
+                                _ => Err(RpcError::NotJson),
                             }
                         }
                     }
                 } else {
-                    Err(RpcError::InvalidData)
+                    Err(RpcError::NotJson)
                 }
             }
         }
@@ -535,7 +535,7 @@ mod tests {
                             .map(move |data| {
                                      acc && data == vec![Value::Bool(true), Value::Bool(false)]
                                  })
-                            .map_err(|_| RpcError::InvalidData)
+                            .map_err(|_| RpcError::NotJson)
                     }
                     _ => unreachable!(),                
                 }
