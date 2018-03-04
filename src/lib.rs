@@ -23,6 +23,7 @@ extern crate rand;
 mod errors;
 mod common;
 mod async;
+mod sync;
 mod source;
 mod sink;
 mod duplex;
@@ -45,6 +46,8 @@ pub use errors::*;
 use common::*;
 use async::{new_in_async, new_out_async, new_in_async_response};
 pub use async::{OutAsync, OutAsyncResponse, InAsync, InAsyncResponse};
+use sync::{new_in_sync, new_out_sync, new_in_sync_response};
+pub use sync::{OutSync, OutSyncResponse, InSync, InSyncResponse};
 use source::{new_rpc_stream, new_out_source, new_out_source_cancelable};
 pub use source::{OutSource, OutSourceCancelable, RpcStream, CancelSource};
 use sink::{new_out_sink, new_rpc_sink};
@@ -170,7 +173,11 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                     match handle {
                         IncomingPacket::Request(req) => {
                             match rpc.type_ {
-                                RpcType::Sync => unimplemented!(),
+                                RpcType::Sync => {
+                                    Ok(Async::Ready(Some((rpc.name,
+                                                          rpc.args,
+                                                          IncomingRpc::Sync(new_in_sync(req))))))
+                                }
 
                                 RpcType::Async => {
                                     Ok(Async::Ready(Some((rpc.name,
@@ -199,65 +206,6 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                 }
             }
         }
-
-        // let packet = try_ready!(self.ps_in.poll());
-        //
-        // match packet {
-        //     None => Ok(Async::Ready(None)),
-        //
-        //     Some(IncomingPacket::Request(req)) => {
-        //         if !req.packet().is_json_packet() {
-        //             return Err(RpcError::InvalidData);
-        //         }
-        //
-        //         match serde_json::from_slice::<Rpc>(req.packet().data()) {
-        //             Ok(rpc) => {
-        //                 match rpc.type_ {
-        //                     RpcType::Sync => {
-        //                         Ok(Async::Ready(Some((rpc.name,
-        //                                               rpc.args,
-        //                                               IncomingRpc::Sync(InSync::new(req))))))
-        //                     }
-        //                     RpcType::Async => {
-        //                         Ok(Async::Ready(Some((rpc.name,
-        //                                               rpc.args,
-        //                                               IncomingRpc::Async(InAsync::new(req))))))
-        //                     }
-        //                     _ => Err(RpcError::InvalidData),
-        //                 }
-        //             }
-        //             Err(err) => Err(RpcError::InvalidData),
-        //         }
-        //     }
-        //
-        //     Some(IncomingPacket::Duplex(p, ps_sink, ps_stream)) => {
-        //         if !p.is_json_packet() {
-        //             return Err(RpcError::InvalidData);
-        //         }
-        //
-        //         match serde_json::from_slice::<Rpc>(p.data()) {
-        //             Ok(rpc) => {
-        //                 match rpc.type_ {
-        //                     RpcType::Source => {
-        //                         Ok(Async::Ready(Some((rpc.name,
-        //                                               rpc.args,
-        //                                               IncomingRpc::Source(RpcSink::new(ps_sink))))))
-        //                     }
-        //                     RpcType::Sink => {
-        //                         Ok(Async::Ready(Some((rpc.name,
-        //                                               rpc.args,
-        //                                               IncomingRpc::Sink(RpcStream::new(ps_stream))))))
-        //                     }
-        //                     RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args,
-        //                         IncomingRpc::Duplex(RpcSink::new(ps_sink),
-        //                         RpcStream::new(ps_stream)))))),
-        //                     _ => Err(RpcError::InvalidData),
-        //                 }
-        //             }
-        //             Err(err) => Err(RpcError::InvalidData),
-        //         }
-        //     }
-        // }
     }
 }
 
@@ -298,7 +246,22 @@ impl<R, W> RpcOut<R, W>
         (new_out_async(out_req), new_in_async_response(in_res))
     }
 
-    // TODO sync
+    /// Send a sync request to the peer.
+    ///
+    /// The `OutSync` Future must be polled to actually start sending the request.
+    /// The `InSyncResponse` Future can be polled to receive the response.
+    ///
+    /// `Res` is the type of a successful response, `E` is the type of an error response.
+    pub fn sync<RPC: Rpc, Res: DeserializeOwned, E: DeserializeOwned>
+        (&mut self,
+         rpc: &RPC)
+         -> (OutSync<W>, InSyncResponse<R, Res, E>) {
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Sync, rpc);
+
+        let (out_req, in_res) = self.0
+            .request(unwrap_serialize(&out_rpc), PacketType::Json);
+        (new_out_sync(out_req), new_in_sync_response(in_res))
+    }
 
     /// Send a source request to the peer.
     ///
@@ -379,8 +342,8 @@ pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
     Duplex(RpcSink<W>, RpcStream<R, Value, Value>),
     /// An async request. You get an InAsync, the peer got an InAsyncResponse.
     Async(InAsync<W>),
-               // /// A sync request. You get an InSync, the peer got an OutSync.
-               // Sync(InSync<W, B>)
+    /// A sync request. You get an InSync, the peer got an InAsyncResponse.
+    Sync(InSync<W>),
 }
 
 #[cfg(test)]
@@ -454,6 +417,75 @@ mod tests {
         let (req1, res1) = a_out.async::<_, [u8; 8], i32>(&TestRpc([8, 9, 10, 11, 12, 13, 14, 15]));
         let (req2, res2) = a_out.async::<_, [u8; 8], i32>(&TestRpc([16, 17, 18, 19, 20, 21, 22,
                                                                     23]));
+
+        let send_all = req0.join3(req1, req2)
+            .and_then(|_| poll_fn(|| a_out.close()));
+
+        let receive_all = res0.join3(res1, res2)
+            .map(|(r0_data, r1_data, r2_data)| {
+                     return r0_data == [0, 1, 2, 3, 4, 5, 6, 7] &&
+                            r1_data == [8, 9, 10, 11, 12, 13, 14, 15] &&
+                            r2_data == [16, 17, 18, 19, 20, 21, 22, 23];
+                 });
+
+        return echo.join4(consume_a.map_err(|_| unreachable!()),
+                          send_all.map_err(|_| unreachable!()),
+                          receive_all.map_err(|_| unreachable!()))
+                   .map(|(_, _, _, worked)| worked)
+                   .wait()
+                   .unwrap();
+    }
+
+    #[test]
+    fn sync() {
+        let rng = StdGen::new(rand::thread_rng(), 20);
+        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
+        quickcheck.quickcheck(test_sync as
+                              fn(usize,
+                                 usize,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>,
+                                 PartialWithErrors<GenInterruptedWouldBlock>)
+                                 -> bool);
+    }
+
+    fn test_sync(buf_size_a: usize,
+                 buf_size_b: usize,
+                 write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                 read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
+                 write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
+                 read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
+                 -> bool {
+        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
+        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
+        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
+
+        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
+        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
+        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+
+        let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
+        let (b_in, mut b_out, _) = muxrpc(reader_b, writer_a);
+
+        let echo = b_in.for_each(|(names, args, in_rpc)| {
+                assert_eq!(names,
+                           vec!["foo".to_string(), "bar".to_string()].into_boxed_slice());
+                match in_rpc {
+                    IncomingRpc::Sync(in_sync) => {
+                        in_sync.respond(&args).map_err(|_| unreachable!())
+                    }
+                    _ => unreachable!(),                
+                }
+            })
+            .and_then(|_| poll_fn(|| b_out.close()).map_err(|_| unreachable!()));
+
+        let consume_a = a_in.for_each(|_| ok(()));
+
+        let (req0, res0) = a_out.sync::<_, [u8; 8], i32>(&TestRpc([0, 1, 2, 3, 4, 5, 6, 7]));
+        let (req1, res1) = a_out.sync::<_, [u8; 8], i32>(&TestRpc([8, 9, 10, 11, 12, 13, 14, 15]));
+        let (req2, res2) = a_out.sync::<_, [u8; 8], i32>(&TestRpc([16, 17, 18, 19, 20, 21, 22,
+                                                                   23]));
 
         let send_all = req0.join3(req1, req2)
             .and_then(|_| poll_fn(|| a_out.close()));
