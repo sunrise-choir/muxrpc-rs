@@ -15,9 +15,9 @@ type OutRes<W> = OutResponse<W, Box<[u8]>>;
 type OutReq<W> = OutRequest<W, Box<[u8]>>;
 type InReq<W> = InRequest<W, Box<[u8]>>;
 
-/// An outgoing async, created by this muxrpc.
+/// An outgoing async request, created by this muxrpc.
 ///
-/// Poll it to actually start sending the async.
+/// Poll it to actually start sending the async request.
 pub struct OutAsync<W: AsyncWrite> {
     out_request: OutReq<W>,
 }

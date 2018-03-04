@@ -25,6 +25,7 @@ mod common;
 mod async;
 mod source;
 mod sink;
+mod duplex;
 
 use std::convert::From;
 use std::fmt::{Display, Formatter};
@@ -48,6 +49,8 @@ use source::{new_rpc_stream, new_out_source, new_out_source_cancelable};
 pub use source::{OutSource, OutSourceCancelable, RpcStream, CancelSource};
 use sink::{new_out_sink, new_rpc_sink};
 pub use sink::{OutSink, RpcSink};
+use duplex::new_out_duplex;
+pub use duplex::OutDuplex;
 
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -185,7 +188,7 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
 
                                 RpcType::Sink => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Sink(new_rpc_stream(ps_stream)))))),
 
-                                RpcType::Duplex => unimplemented!(),
+                                RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Duplex(new_rpc_sink(ps_sink), new_rpc_stream(ps_stream)))))),
 
                                 _ => Err(RpcError::InvalidData),
                             }
@@ -300,7 +303,7 @@ impl<R, W> RpcOut<R, W>
     /// Send a source request to the peer.
     ///
     /// The `OutSource` Future must be polled to actually start sending the request.
-    /// The `InSink` can be polled to receive the responses.
+    /// The `RpcStream` can be polled to receive the responses.
     ///
     /// `I` is the type of the responses, `E` is the type of an error response.
     pub fn source<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
@@ -342,13 +345,23 @@ impl<R, W> RpcOut<R, W>
         new_out_sink(ps_sink, unwrap_serialize(&out_rpc))
     }
 
-    // TODO duplex
-    /// Close the rpc channel, indicating that no more rpcs will be sent.
+    /// Send a duplex request to the peer.
     ///
-    /// This does not immediately close if there are still unfinished
-    /// TODO list stuff. In that case, the closing
-    /// happens when the last of them finishes.
+    /// The `OutSDuplex` Future must be polled to actually start sending the request, and it yields
+    /// a sink for sending more data to the peer.
+    /// The `RpcStream` can be polled to receive the responses.
     ///
+    /// `I` is the type of the responses, `E` is the type of an error response.
+    pub fn duplex<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
+        (&mut self,
+         rpc: &RPC)
+         -> (OutDuplex<W>, RpcStream<R, I, E>) {
+        let out_rpc = OutRpc::new(RPC::names(), RpcType::Duplex, rpc);
+
+        let (ps_sink, ps_stream) = self.0.duplex();
+        (new_out_duplex(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
+    }
+
     /// The error contains a `None` if an TODO list stuff errored previously.
     pub fn close(&mut self) -> Poll<(), Option<io::Error>> {
         self.0.close()
@@ -362,64 +375,13 @@ pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
     Source(RpcSink<W>),
     /// A sink request. You get a stream, the peer got a sink.
     Sink(RpcStream<R, Value, Value>),
-    // /// A duplex request. Both peers get a stream and a sink.
-    // Duplex(RpcSink<W, B>, RpcStream<R>),
+    /// A duplex request. Both peers get a stream and a sink.
+    Duplex(RpcSink<W>, RpcStream<R, Value, Value>),
     /// An async request. You get an InAsync, the peer got an InAsyncResponse.
     Async(InAsync<W>),
                // /// A sync request. You get an InSync, the peer got an OutSync.
                // Sync(InSync<W, B>)
 }
-
-
-// /// A sink for writing data to the peer.
-// pub struct RpcSink<W: AsyncWrite, B: AsRef<[u8]>> {
-//     sink: PsSink<W, B>,
-// }
-//
-// impl<W: AsyncWrite, B: AsRef<[u8]>> RpcSink<W, B> {
-//     fn new(ps_sink: PsSink<W, B>) -> RpcSink<W, B> {
-//         unimplemented!()
-//     }
-// }
-//
-// /// A stream for receiving data from the peer.
-// pub struct RpcStream<R: AsyncRead> {
-//     stream: PsStream<R>,
-// }
-//
-// impl<R: AsyncRead> RpcStream<R> {
-//     fn new(ps_stream: PsStream<R>) -> RpcStream<R> {
-//         unimplemented!()
-//     }
-// }
-//
-// /// Allows sending a single value to the peer.
-// pub struct InAsync<W: AsyncWrite, B: AsRef<[u8]>> {
-//     in_request: InRequest<W, B>,
-// }
-//
-// impl<W: AsyncWrite, B: AsRef<[u8]>> InAsync<W, B> {
-//     fn new(in_req: InRequest<W, B>) -> InAsync<W, B> {
-//         unimplemented!()
-//     }
-// }
-//
-// /// Allows sending a single value to the peer.
-// pub struct InSync<W: AsyncWrite, B: AsRef<[u8]>> {
-//     in_request: InRequest<W, B>,
-// }
-//
-// impl<W: AsyncWrite, B: AsRef<[u8]>> InSync<W, B> {
-//     fn new(in_req: InRequest<W, B>) -> InSync<W, B> {
-//         unimplemented!()
-//     }
-// }
-
-// /// Allows receiving a single value from the peer.
-// pub struct OutSync<R: AsyncRead> {
-//     in_response: InResponse<R>,
-// }
-
 
 #[cfg(test)]
 mod tests {

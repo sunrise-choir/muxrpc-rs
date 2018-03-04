@@ -137,6 +137,8 @@ pub fn new_rpc_stream<R: AsyncRead, I, E>(ps_stream: PsStream<R>) -> RpcStream<R
 
 impl<R: AsyncRead, I: DeserializeOwned, E: DeserializeOwned> Stream for RpcStream<R, I, E> {
     type Item = I;
+    /// A `ConnectionRpcError::InvalidData` is non-fatal and polling the stream may be safely
+    /// continued.
     type Error = ConnectionRpcError<E>;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {

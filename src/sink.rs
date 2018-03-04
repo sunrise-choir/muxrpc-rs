@@ -16,10 +16,11 @@ type MuxrpcSink<W> = PsSink<W, Box<[u8]>>;
 /// An outgoing sink request, created by this muxrpc.
 ///
 /// Poll it to actually start sending the sink request. It yields the `RpcSink`.
-pub struct OutSink<W: AsyncWrite>(SendClose<MuxrpcSink<W>>);
+pub struct OutSink<W: AsyncWrite>(Send<MuxrpcSink<W>>);
 
 pub fn new_out_sink<W: AsyncWrite>(ps_sink: MuxrpcSink<W>, initial_data: Box<[u8]>) -> OutSink<W> {
-    OutSink(SendClose::new(ps_sink, (initial_data, META_NON_END)))
+    // OutSink(SendClose::new(ps_sink, (initial_data, META_NON_END)))
+    OutSink(ps_sink.send((initial_data, META_NON_END)))
 }
 
 impl<W: AsyncWrite> Future for OutSink<W> {
