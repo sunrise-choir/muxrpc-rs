@@ -59,14 +59,14 @@ pub use duplex::OutDuplex;
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 struct OutRpc<'a, 'b, A: 'b> {
-    name: Box<[&'a str]>,
+    name: &'a [&'a str],
     #[serde(rename = "type")]
     type_: RpcType,
     args: &'b A,
 }
 
 impl<'a, 'b, A: Serialize + 'b> OutRpc<'a, 'b, A> {
-    fn new(name: Box<[&'a str]>, type_: RpcType, args: &'b A) -> OutRpc<'a, 'b, A> {
+    fn new(name: &'a [&'a str], type_: RpcType, args: &'b A) -> OutRpc<'a, 'b, A> {
         OutRpc { name, type_, args }
     }
 }
@@ -95,7 +95,7 @@ enum RpcType {
 /// should provide the argument value(s).
 pub trait Rpc: Serialize {
     /// The names for this rpc.
-    fn names() -> Box<[&'static str]>;
+    fn names() -> &'static [&'static str];
 }
 
 /// A future that emits the wrapped writer of a muxrpc connection once the outgoing half of the
@@ -351,9 +351,11 @@ mod tests {
     #[derive(Serialize)]
     struct TestRpc([u8; 8]);
 
+    const NAMES: [&'static str; 2] = ["foo", "bar"];
+
     impl Rpc for TestRpc {
-        fn names() -> Box<[&'static str]> {
-            vec!["foo", "bar"].into_boxed_slice()
+        fn names() -> &'static [&'static str] {
+            &NAMES
         }
     }
 
@@ -396,7 +398,7 @@ mod tests {
                     IncomingRpc::Async(in_async) => {
                         in_async.respond(&args).map_err(|_| unreachable!())
                     }
-                    _ => unreachable!(),                
+                    _ => unreachable!(),
                 }
             })
             .and_then(|_| b_out.close().map_err(|_| unreachable!()));
@@ -464,7 +466,7 @@ mod tests {
                     IncomingRpc::Sync(in_sync) => {
                         in_sync.respond(&args).map_err(|_| unreachable!())
                     }
-                    _ => unreachable!(),                
+                    _ => unreachable!(),
                 }
             })
             .and_then(|_| b_out.close().map_err(|_| unreachable!()));
@@ -537,7 +539,7 @@ mod tests {
                                  })
                             .map_err(|_| RpcError::NotJson)
                     }
-                    _ => unreachable!(),                
+                    _ => unreachable!(),
                 }
             })
             .and_then(|worked| {
@@ -614,7 +616,7 @@ mod tests {
                             .map_err(|_| unreachable!())
                             .map(|_| ())
                     }
-                    _ => unreachable!(),                
+                    _ => unreachable!(),
                 }
             })
             .and_then(|_| b_out.close().map_err(|_| unreachable!()));
