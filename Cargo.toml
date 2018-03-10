@@ -5,7 +5,7 @@ authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "The muxrpc rpc protocol in rust."
 repository = "https://github.com/AljoschaMeyer/muxrpc-rs"
 readme = "README.md"
-license = "GPL-3.0"
+license = "AGPL-3.0"
 
 [dependencies]
 futures = "0.1.17"
