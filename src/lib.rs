@@ -6,22 +6,20 @@
 
 extern crate atm_async_utils;
 #[macro_use]
-extern crate futures;
+extern crate futures_core;
+extern crate futures_sink;
+extern crate futures_io;
+extern crate futures_util;
 extern crate packet_stream;
-extern crate tokio_io;
 extern crate serde;
 extern crate serde_json;
 #[macro_use(Serialize, Deserialize)]
 extern crate serde_derive;
 
 #[cfg(test)]
-extern crate partial_io;
-#[cfg(test)]
-extern crate quickcheck;
-#[cfg(test)]
 extern crate async_ringbuffer;
 #[cfg(test)]
-extern crate rand;
+extern crate futures;
 
 mod errors;
 mod common;
@@ -34,10 +32,12 @@ mod duplex;
 use std::convert::From;
 use std::io;
 
-use futures::prelude::*;
-use futures::unsync::oneshot::Canceled;
-use tokio_io::{AsyncRead, AsyncWrite};
-use packet_stream::{packet_stream, PsIn, PsOut, IncomingPacket, PacketType, ClosePs};
+use futures_core::{Future, Stream, Poll};
+use futures_core::Async::Ready;
+use futures_core::task::Context;
+use futures_io::{AsyncRead, AsyncWrite};
+use packet_stream::{packet_stream, PsIn, PsOut, IncomingPacket, PacketType, ClosePs,
+                    Done as PsDone};
 use serde_json::Value;
 use serde_json::{to_vec, from_slice};
 use serde::Serialize;
@@ -45,16 +45,16 @@ use serde::de::DeserializeOwned;
 
 pub use errors::*;
 use common::*;
-use async::{new_in_async, new_out_async, new_in_async_response};
-pub use async::{OutAsync, OutAsyncResponse, InAsync, InAsyncResponse};
-use sync::{new_in_sync, new_out_sync, new_in_sync_response};
-pub use sync::{OutSync, OutSyncResponse, InSync, InSyncResponse};
-use source::{new_rpc_stream, new_out_source, new_out_source_cancelable};
-pub use source::{OutSource, OutSourceCancelable, RpcStream, CancelSource};
-use sink::{new_out_sink, new_rpc_sink};
-pub use sink::{OutSink, RpcSink};
-use duplex::new_out_duplex;
-pub use duplex::OutDuplex;
+use async::{new_peer_async, new_async, new_async_response};
+pub use async::{Async, PeerAsyncResponse, PeerAsync, AsyncResponse};
+use sync::{new_peer_sync, new_sync, new_sync_response};
+pub use sync::{Sync, PeerSyncResponse, PeerSync, SyncResponse};
+use source::{new_rpc_stream, new_source, new_source_cancelable};
+pub use source::{Source, SourceCancelable, RpcStream, CancelSource};
+use sink::{new_sink, new_rpc_sink};
+pub use sink::{MuxSink, RpcSink};
+use duplex::new_duplex;
+pub use duplex::Duplex;
 
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,17 +100,17 @@ pub trait Rpc: Serialize {
 
 /// A future that emits the wrapped writer of a muxrpc connection once the outgoing half of the
 /// has been fully closed.
-pub struct Closed<W>(packet_stream::Closed<W, Box<[u8]>>);
+pub struct Done<W>(PsDone<W, Box<[u8]>>);
 
-impl<W> Future for Closed<W> {
+impl<W> Future for Done<W> {
     type Item = W;
     /// This can only be emitted if a handle to the underlying transport has been polled but was
     /// dropped before it was done. If all handles are polled/closed properly, this error is never
     /// emitted.
-    type Error = Canceled;
+    type Error = W;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.0.poll()
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        self.0.poll(cx)
     }
 }
 
@@ -120,9 +120,9 @@ impl<W> Future for Closed<W> {
 /// `R` is the `AsyncRead` for reading bytes from the peer, `W` is the
 /// `AsyncWrite` for writing bytes to the peer, and `B` is the type that is used
 /// as input for sending data.
-pub fn muxrpc<R: AsyncRead, W: AsyncWrite>(r: R, w: W) -> (RpcIn<R, W>, RpcOut<R, W>, Closed<W>) {
-    let (ps_in, ps_out, closed) = packet_stream(r, w);
-    (RpcIn::new(ps_in), RpcOut::new(ps_out), Closed(closed))
+pub fn muxrpc<R: AsyncRead, W: AsyncWrite>(r: R, w: W) -> (RpcIn<R, W>, RpcOut<R, W>, Done<W>) {
+    let (ps_in, ps_out, done) = packet_stream(r, w);
+    (RpcIn::new(ps_in), RpcOut::new(ps_out), Done(done))
 }
 
 /// A stream of incoming rpcs from the peer.
@@ -139,9 +139,9 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
     type Item = (Box<[String]>, Box<[Value]>, IncomingRpc<R, W>);
     type Error = RpcError;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match try_ready!(self.0.poll()) {
-            None => Ok(Async::Ready(None)),
+    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Self::Item>, Self::Error> {
+        match try_ready!(self.0.poll_next(cx)) {
+            None => Ok(Ready(None)),
 
             Some((data, metadata, handle)) => {
                 if metadata.packet_type == PacketType::Json {
@@ -151,15 +151,15 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
                         IncomingPacket::Request(req) => {
                             match rpc.type_ {
                                 RpcType::Sync => {
-                                    Ok(Async::Ready(Some((rpc.name,
-                                                          rpc.args,
-                                                          IncomingRpc::Sync(new_in_sync(req))))))
+                                    Ok(Ready(Some((rpc.name,
+                                                   rpc.args,
+                                                   IncomingRpc::Sync(new_peer_sync(req))))))
                                 }
 
                                 RpcType::Async => {
-                                    Ok(Async::Ready(Some((rpc.name,
-                                                          rpc.args,
-                                                          IncomingRpc::Async(new_in_async(req))))))
+                                    Ok(Ready(Some((rpc.name,
+                                                   rpc.args,
+                                                   IncomingRpc::Async(new_peer_async(req))))))
                                 }
 
                                 _ => Err(RpcError::NotJson),
@@ -168,11 +168,19 @@ impl<R: AsyncRead, W: AsyncWrite> Stream for RpcIn<R, W> {
 
                         IncomingPacket::Duplex(ps_sink, ps_stream) => {
                             match rpc.type_ {
-                                RpcType::Source => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Source(new_rpc_sink(ps_sink)))))),
+                                RpcType::Source => {
+                                    Ok(Ready(Some((rpc.name,
+                                                   rpc.args,
+                                                   IncomingRpc::Source(new_rpc_sink(ps_sink))))))
+                                }
 
-                                RpcType::Sink => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Sink(new_rpc_stream(ps_stream)))))),
+                                RpcType::Sink => {
+                                    Ok(Ready(Some((rpc.name,
+                                                   rpc.args,
+                                                   IncomingRpc::Sink(new_rpc_stream(ps_stream))))))
+                                }
 
-                                RpcType::Duplex => Ok(Async::Ready(Some((rpc.name, rpc.args, IncomingRpc::Duplex(new_rpc_sink(ps_sink), new_rpc_stream(ps_stream)))))),
+                                RpcType::Duplex => Ok(Ready(Some((rpc.name, rpc.args, IncomingRpc::Duplex(new_rpc_sink(ps_sink), new_rpc_stream(ps_stream)))))),
 
                                 _ => Err(RpcError::NotJson),
                             }
@@ -208,57 +216,57 @@ impl<R, W> RpcOut<R, W>
 {
     /// Send an async request to the peer.
     ///
-    /// The `OutAsync` Future must be polled to actually start sending the request.
-    /// The `InAsyncResponse` Future can be polled to receive the response.
+    /// The `Async` Future must be polled to actually start sending the request.
+    /// The `AsyncResponse` Future can be polled to receive the response.
     ///
     /// `Res` is the type of a successful response, `E` is the type of an error response.
     pub fn async<RPC: Rpc, Res: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutAsync<W>, InAsyncResponse<R, Res, E>) {
+         -> (Async<W>, AsyncResponse<R, Res, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Async, rpc);
 
         let (out_req, in_res) = self.0
             .request(unwrap_serialize(&out_rpc), PacketType::Json);
-        (new_out_async(out_req), new_in_async_response(in_res))
+        (new_async(out_req), new_async_response(in_res))
     }
 
     /// Send a sync request to the peer.
     ///
-    /// The `OutSync` Future must be polled to actually start sending the request.
-    /// The `InSyncResponse` Future can be polled to receive the response.
+    /// The `Sync` Future must be polled to actually start sending the request.
+    /// The `SyncResponse` Future can be polled to receive the response.
     ///
     /// `Res` is the type of a successful response, `E` is the type of an error response.
     pub fn sync<RPC: Rpc, Res: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutSync<W>, InSyncResponse<R, Res, E>) {
+         -> (Sync<W>, SyncResponse<R, Res, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Sync, rpc);
 
         let (out_req, in_res) = self.0
             .request(unwrap_serialize(&out_rpc), PacketType::Json);
-        (new_out_sync(out_req), new_in_sync_response(in_res))
+        (new_sync(out_req), new_sync_response(in_res))
     }
 
     /// Send a source request to the peer.
     ///
-    /// The `OutSource` Future must be polled to actually start sending the request.
+    /// The `Source` Future must be polled to actually start sending the request.
     /// The `RpcStream` can be polled to receive the responses.
     ///
     /// `I` is the type of the responses, `E` is the type of an error response.
     pub fn source<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutSource<W>, RpcStream<R, I, E>) {
+         -> (Source<W>, RpcStream<R, I, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Source, rpc);
 
         let (ps_sink, ps_stream) = self.0.duplex();
-        (new_out_source(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
+        (new_source(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
     /// Send a source request to the peer, that may be cancelled at any time.
     ///
-    /// The `OutSource` Future must be polled to actually start sending the request, and it yields
+    /// The `Source` Future must be polled to actually start sending the request, and it yields
     /// a handle for cancelling the source. Note that if the handle is not used for cancelling, it
     /// *must* still be closed.
     /// The `InSink` can be polled to receive the responses.
@@ -267,22 +275,22 @@ impl<R, W> RpcOut<R, W>
     pub fn source_cancelable<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutSourceCancelable<W>, RpcStream<R, I, E>) {
+         -> (SourceCancelable<W>, RpcStream<R, I, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Source, rpc);
 
         let (ps_sink, ps_stream) = self.0.duplex();
-        (new_out_source_cancelable(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
+        (new_source_cancelable(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
     /// Send a sink request to the peer.
     ///
-    /// The `OutSink` Future must be polled to actually start sending the request, and it yields
+    /// The `MuxSink` Future must be polled to actually start sending the request, and it yields
     /// a sink for sending more data to the peer.
-    pub fn sink<RPC: Rpc>(&mut self, rpc: &RPC) -> OutSink<W> {
+    pub fn sink<RPC: Rpc>(&mut self, rpc: &RPC) -> MuxSink<W> {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Sink, rpc);
 
         let (ps_sink, _) = self.0.duplex();
-        new_out_sink(ps_sink, unwrap_serialize(&out_rpc))
+        new_sink(ps_sink, unwrap_serialize(&out_rpc))
     }
 
     /// Send a duplex request to the peer.
@@ -295,11 +303,11 @@ impl<R, W> RpcOut<R, W>
     pub fn duplex<RPC: Rpc, I: DeserializeOwned, E: DeserializeOwned>
         (&mut self,
          rpc: &RPC)
-         -> (OutDuplex<W>, RpcStream<R, I, E>) {
+         -> (Duplex<W>, RpcStream<R, I, E>) {
         let out_rpc = OutRpc::new(RPC::names(), RpcType::Duplex, rpc);
 
         let (ps_sink, ps_stream) = self.0.duplex();
-        (new_out_duplex(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
+        (new_duplex(ps_sink, unwrap_serialize(&out_rpc)), new_rpc_stream(ps_stream))
     }
 
     /// Close the muxrpc session. If there are still active handles to the underlying transport,
@@ -317,8 +325,8 @@ impl<R: AsyncRead, W: AsyncWrite> Future for CloseRpc<R, W> {
     type Item = ();
     type Error = Option<io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.0.poll()
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        self.0.poll(cx)
     }
 }
 
@@ -330,23 +338,22 @@ pub enum IncomingRpc<R: AsyncRead, W: AsyncWrite> {
     Sink(RpcStream<R, Value, Value>),
     /// A duplex request. Both peers get a stream and a sink.
     Duplex(RpcSink<W>, RpcStream<R, Value, Value>),
-    /// An async request. You get an InAsync, the peer got an InAsyncResponse.
-    Async(InAsync<W>),
-    /// A sync request. You get an InSync, the peer got an InAsyncResponse.
-    Sync(InSync<W>),
+    /// An async request. You get an PeerAsync, the peer got an AsyncResponse.
+    Async(PeerAsync<W>),
+    /// A sync request. You get an PeerSync, the peer got an AsyncResponse.
+    Sync(PeerSync<W>),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use partial_io::{PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
-    use partial_io::quickcheck_types::GenInterruptedWouldBlock;
-    use quickcheck::{QuickCheck, StdGen};
     use async_ringbuffer::*;
-    use rand;
-    use futures::stream::iter_ok;
+    use futures::prelude::*;
     use futures::future::ok;
+    use futures::stream::iter_ok;
+    use futures::sink::close;
+    use futures::executor::block_on;
 
     #[derive(Serialize)]
     struct TestRpc([u8; 8]);
@@ -360,33 +367,9 @@ mod tests {
     }
 
     #[test]
-    fn async() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_async as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_async(buf_size_a: usize,
-                  buf_size_b: usize,
-                  write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                  read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                  write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                  read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                  -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_async() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
         let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
@@ -419,42 +402,17 @@ mod tests {
                             r2_data == [16, 17, 18, 19, 20, 21, 22, 23];
                  });
 
-        return echo.join4(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()),
-                          receive_all.map_err(|_| unreachable!()))
-                   .map(|(_, _, _, worked)| worked)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join4(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()),
+                                    receive_all.map_err(|_| unreachable!()))
+                             .map(|(_, _, _, worked)| assert!(worked)))
+                        .is_ok());
     }
 
     #[test]
-    fn sync() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_sync as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_sync(buf_size_a: usize,
-                 buf_size_b: usize,
-                 write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                 read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                 write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                 read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                 -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_sync() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
         let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
@@ -487,42 +445,17 @@ mod tests {
                             r2_data == [16, 17, 18, 19, 20, 21, 22, 23];
                  });
 
-        return echo.join4(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()),
-                          receive_all.map_err(|_| unreachable!()))
-                   .map(|(_, _, _, worked)| worked)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join4(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()),
+                                    receive_all.map_err(|_| unreachable!()))
+                             .map(|(_, _, _, worked)| assert!(worked)))
+                        .is_ok());
     }
 
     #[test]
-    fn sink() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_sink as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_sink(buf_size_a: usize,
-                 buf_size_b: usize,
-                 write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                 read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                 write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                 read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                 -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_sink() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
         let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
@@ -556,51 +489,28 @@ mod tests {
             out_sink0.and_then(|rpc_sink| {
                                    rpc_sink.send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
                                                                           Ok(Value::Bool(false))]))
+                                                                          .and_then(|(rpc_sink, _)| close(rpc_sink))
                                });
         let out_sink1 = a_out.sink(&TestRpc([0, 1, 2, 3, 4, 5, 6, 99]));
         let out1 =
             out_sink1.and_then(|rpc_sink| {
                                    rpc_sink.send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
                                                                           Ok(Value::Bool(false))]))
+                                                                          .and_then(|(rpc_sink, _)| close(rpc_sink))
                                });
 
         let send_all = out0.join(out1).and_then(|_| a_out.close());
 
-        return echo.join3(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()))
-                   .map(|(worked, _, _)| worked)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join3(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()))
+                             .map(|(worked, _, _)| worked))
+                        .is_ok());
     }
 
     #[test]
-    fn source() {
-        let rng = StdGen::new(rand::thread_rng(), 20);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1000);
-        quickcheck.quickcheck(test_source as
-                              fn(usize,
-                                 usize,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>,
-                                 PartialWithErrors<GenInterruptedWouldBlock>)
-                                 -> bool);
-    }
-
-    fn test_source(buf_size_a: usize,
-                   buf_size_b: usize,
-                   write_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                   read_ops_a: PartialWithErrors<GenInterruptedWouldBlock>,
-                   write_ops_b: PartialWithErrors<GenInterruptedWouldBlock>,
-                   read_ops_b: PartialWithErrors<GenInterruptedWouldBlock>)
-                   -> bool {
-        let (writer_a, reader_a) = ring_buffer(buf_size_a + 1);
-        let writer_a = PartialAsyncWrite::new(writer_a, write_ops_a);
-        let reader_a = PartialAsyncRead::new(reader_a, read_ops_a);
-
-        let (writer_b, reader_b) = ring_buffer(buf_size_b + 1);
-        let writer_b = PartialAsyncWrite::new(writer_b, write_ops_b);
-        let reader_b = PartialAsyncRead::new(reader_b, read_ops_b);
+    fn test_source() {
+        let (writer_a, reader_a) = ring_buffer(2);
+        let (writer_b, reader_b) = ring_buffer(2);
 
         let (a_in, mut a_out, _) = muxrpc(reader_a, writer_b);
         let (b_in, b_out, _) = muxrpc(reader_b, writer_a);
@@ -613,6 +523,7 @@ mod tests {
                         rpc_sink
                             .send_all(iter_ok::<_, Option<io::Error>>(vec![Ok(Value::Bool(true)),
                                                                            Ok(Value::Bool(false))]))
+                            .and_then(|(rpc_sink, _)| close(rpc_sink))
                             .map_err(|_| unreachable!())
                             .map(|_| ())
                     }
@@ -634,11 +545,12 @@ mod tests {
         let send_all = out_source0.join(out_source1).and_then(|_| a_out.close());
         let process_all = stream0.join(stream1);
 
-        return echo.join4(consume_a.map_err(|_| unreachable!()),
-                          send_all.map_err(|_| unreachable!()),
-                          process_all.map_err(|_| unreachable!()))
-                   .map(|(_, _, _, (worked0, worked1))| worked0 && worked1)
-                   .wait()
-                   .unwrap();
+        assert!(block_on(echo.join4(consume_a.map_err(|_| unreachable!()),
+                                    send_all.map_err(|_| unreachable!()),
+                                    process_all.map_err(|err| panic!("{:?}", err)))
+                             .map(|(_, _, _, (worked0, worked1))| {
+                                      assert!(worked0 && worked1)
+                                  }))
+                        .is_ok());
     }
 }

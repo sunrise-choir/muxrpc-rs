@@ -2,10 +2,13 @@ use std::convert::From;
 use std::io;
 use std::marker::PhantomData;
 
-use atm_async_utils::sink_futures::{Close, SendClose};
-use futures::prelude::*;
-use futures::sink::Send;
-use tokio_io::{AsyncRead, AsyncWrite};
+use atm_async_utils::SendClose;
+use futures_core::{Future, Poll};
+use futures_core::Async::Ready;
+use futures_core::task::Context;
+use futures_io::{AsyncRead, AsyncWrite};
+use futures_util::SinkExt;
+use futures_util::sink::{Send, Close, close};
 use packet_stream::{PsSink, PsStream, PacketType};
 use serde_json::from_slice;
 use serde::de::DeserializeOwned;
@@ -17,42 +20,40 @@ type MuxrpcSink<W> = PsSink<W, Box<[u8]>>;
 /// An outgoing source request, created by this muxrpc.
 ///
 /// Poll it to actually start sending the source request.
-pub struct OutSource<W: AsyncWrite>(SendClose<MuxrpcSink<W>>);
+pub struct Source<W: AsyncWrite>(SendClose<MuxrpcSink<W>>);
 
-pub fn new_out_source<W: AsyncWrite>(ps_sink: MuxrpcSink<W>,
-                                     initial_data: Box<[u8]>)
-                                     -> OutSource<W> {
-    OutSource(SendClose::new(ps_sink, (initial_data, META_NON_END)))
+pub fn new_source<W: AsyncWrite>(ps_sink: MuxrpcSink<W>, initial_data: Box<[u8]>) -> Source<W> {
+    Source(SendClose::new(ps_sink, (initial_data, META_NON_END)))
 }
 
-impl<W: AsyncWrite> Future for OutSource<W> {
+impl<W: AsyncWrite> Future for Source<W> {
     type Item = ();
     type Error = Option<io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let _ = try_ready!(self.0.poll());
-        Ok(Async::Ready(()))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        let _ = try_ready!(self.0.poll(cx));
+        Ok(Ready(()))
     }
 }
 
 /// An outgoing source request, created by this muxrpc.
 ///
 /// Poll it to actually start sending the source request and get a handle to cancel the source.
-pub struct OutSourceCancelable<W: AsyncWrite>(Send<MuxrpcSink<W>>);
+pub struct SourceCancelable<W: AsyncWrite>(Send<MuxrpcSink<W>>);
 
-pub fn new_out_source_cancelable<W: AsyncWrite>(ps_sink: MuxrpcSink<W>,
-                                                initial_data: Box<[u8]>)
-                                                -> OutSourceCancelable<W> {
-    OutSourceCancelable(ps_sink.send((initial_data, META_NON_END)))
+pub fn new_source_cancelable<W: AsyncWrite>(ps_sink: MuxrpcSink<W>,
+                                            initial_data: Box<[u8]>)
+                                            -> SourceCancelable<W> {
+    SourceCancelable(ps_sink.send((initial_data, META_NON_END)))
 }
 
-impl<W: AsyncWrite> Future for OutSourceCancelable<W> {
+impl<W: AsyncWrite> Future for SourceCancelable<W> {
     type Item = CancelSource<W>;
     type Error = Option<io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let sink = try_ready!(self.0.poll());
-        Ok(Async::Ready(CancelSource::new(sink)))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        let sink = try_ready!(self.0.poll(cx));
+        Ok(Ready(CancelSource::new(sink)))
     }
 }
 
@@ -77,7 +78,7 @@ impl<W: AsyncWrite> CancelSource<W> {
     /// future returned from this method.
     pub fn close(mut self) -> CloseCancelSource<W> {
         match self.0.take().unwrap() {
-            CancelSourceState::PrePoll(sink) => CloseCancelSource(Close::new(sink)),
+            CancelSourceState::PrePoll(sink) => CloseCancelSource(close(sink)),
             CancelSourceState::PostPoll(_) => panic!("Tried to close an already polled CancelSource"),
         }
     }
@@ -87,18 +88,18 @@ impl<W: AsyncWrite> Future for CancelSource<W> {
     type Item = ();
     type Error = Option<io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
         match self.0.take().unwrap() {
             CancelSourceState::PrePoll(sink) => {
                 self.0 = Some(CancelSourceState::PostPoll(SendClose::new(sink,
                                                                          (Box::new(JSON_TRUE),
                                                                           META_END))));
-                self.poll()
+                self.poll(cx)
             }
 
             CancelSourceState::PostPoll(mut future) => {
-                let _ = try_ready!(future.poll());
-                Ok(Async::Ready(()))
+                let _ = try_ready!(future.poll(cx));
+                Ok(Ready(()))
             }
         }
     }
@@ -112,9 +113,9 @@ impl<W: AsyncWrite> Future for CloseCancelSource<W> {
     type Item = ();
     type Error = Option<io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let _ = try_ready!(self.0.poll());
-        Ok(Async::Ready(()))
+    fn poll(&mut self, cx: &mut Context) -> Poll<Self::Item, Self::Error> {
+        let _ = try_ready!(self.0.poll(cx));
+        Ok(Ready(()))
     }
 }
 
@@ -141,18 +142,18 @@ impl<R: AsyncRead, I: DeserializeOwned, E: DeserializeOwned> Stream for RpcStrea
     /// continued.
     type Error = ConnectionRpcError<E>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let (data, metadata) = try_ready!(self.ps_stream.poll()).unwrap(); // PsStream never emits Ok(None)
+    fn poll_next(&mut self, cx: &mut Context) -> Poll<Option<Self::Item>, Self::Error> {
+        let (data, metadata) = try_ready!(self.ps_stream.poll_next(cx)).unwrap(); // PsStream never emits Ok(None)
 
         if metadata.packet_type == PacketType::Json {
             if metadata.is_end {
                 if data[..] == JSON_TRUE[..] {
-                    Ok(Async::Ready(None))
+                    Ok(Ready(None))
                 } else {
                     Err(ConnectionRpcError::PeerError(from_slice::<E>(&data)?))
                 }
             } else {
-                Ok(Async::Ready(Some(from_slice::<I>(&data)?)))
+                Ok(Ready(Some(from_slice::<I>(&data)?)))
             }
         } else {
             Err(ConnectionRpcError::NotJson)
