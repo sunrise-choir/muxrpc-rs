@@ -3,9 +3,9 @@ name = "muxrpc"
 version = "0.3.0"
 authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
 description = "The muxrpc rpc protocol in rust."
-repository = "https://github.com/AljoschaMeyer/muxrpc-rs"
+repository = "https://github.com/sunrise-choir/muxrpc-rs"
 readme = "README.md"
-license = "AGPL-3.0"
+license = "LGPL-3.0"
 
 [dependencies]
 atm-async-utils = "0.2.1"
